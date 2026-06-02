@@ -1,5 +1,7 @@
+import base64
 import io
 import time
+from pathlib import Path
 import streamlit as st
 from analyzer import analyze
 
@@ -10,24 +12,50 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
+# Background — faint world map, slightly darker via pseudo-element opacity
+# ---------------------------------------------------------------------------
+
+_map_path = Path(__file__).parent / "static" / "world_map.png"
+if _map_path.exists():
+    _map_b64 = base64.b64encode(_map_path.read_bytes()).decode()
+    st.markdown(f"""
+    <style>
+    /* Render the map in a pseudo-element so opacity only affects the image,
+       not the page content. 0.18 = slightly darker than before (was ~0.12). */
+    .stApp::before {{
+        content: "";
+        position: fixed;
+        inset: 0;
+        background-image: url("data:image/png;base64,{_map_b64}");
+        background-size: cover;
+        background-position: center;
+        background-repeat: no-repeat;
+        opacity: 0.12;
+        z-index: 0;
+        pointer-events: none;
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _round_dist(value, round_to: str):
+def _round_dist(value, decimals: int):
+    """Round a distance value to `decimals` decimal places (0 = whole number)."""
     if not isinstance(value, (int, float)):
         return value
-    if round_to == "whole":
-        return int(round(value, 0))
-    return round(value, 2)
+    rounded = round(value, decimals)
+    return int(rounded) if decimals == 0 else rounded
 
 
-def fmt_dist(value, round_to: str) -> str:
+def fmt_dist(value, decimals: int) -> str:
     if value is None:
         return "none within 2 km"
-    v = _round_dist(value, round_to)
-    if round_to == "whole":
+    v = _round_dist(value, decimals)
+    if decimals == 0:
         return f"{v} m"
-    return f"{v:.2f} m"
+    return f"{v:.{decimals}f} m"
 
 
 FEATURE_KEYS = ("Road", "Trail", "Railroad", "Utility Line", "Water Feature")
@@ -61,12 +89,11 @@ def badge(label: str, color: str) -> str:
     )
 
 
-def display_results(result: dict, round_to: str):
+def display_results(result: dict, decimals: int):
     lf = result["linear_features"]
     surface = result["surface"]
     population = result["population"]
 
-    # --- Summary badges ---
     sc = SURFACE_COLOR.get(surface, "#6b7280")
     pc = POPULATION_COLOR.get(population, "#6b7280")
     st.markdown(
@@ -76,7 +103,6 @@ def display_results(result: dict, round_to: str):
     )
     st.markdown("")
 
-    # --- Nearest feature summary ---
     nearest_dist = None
     nearest_type = None
     for key in FEATURE_KEYS:
@@ -86,9 +112,8 @@ def display_results(result: dict, round_to: str):
             nearest_type = key
 
     if nearest_type:
-        st.info(f"**Nearest feature:** {nearest_type} — {fmt_dist(nearest_dist, round_to)}")
+        st.info(f"**Nearest feature:** {nearest_type} — {fmt_dist(nearest_dist, decimals)}")
 
-    # --- Linear feature table ---
     st.markdown("#### Linear Features")
     rows = []
     for key in FEATURE_KEYS:
@@ -97,18 +122,17 @@ def display_results(result: dict, round_to: str):
         name = info.get("name") or ""
         rows.append({
             "Feature":    key,
-            "Distance":   fmt_dist(dist, round_to),
+            "Distance":   fmt_dist(dist, decimals),
             "Name / Ref": name,
         })
-
     st.table(rows)
 
 
 # ---------------------------------------------------------------------------
-# Excel processing (reused from cli.py logic, adapted for Streamlit)
+# Excel processing
 # ---------------------------------------------------------------------------
 
-def process_excel_bytes(file_bytes: bytes, round_to: str) -> bytes:
+def process_excel_bytes(file_bytes: bytes, decimals: int) -> bytes:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -135,7 +159,7 @@ def process_excel_bytes(file_bytes: bytes, round_to: str) -> bytes:
     lon_col = find_col("lon", "long", "longitude")
 
     if lat_col is None or lon_col is None:
-        st.error("Could not find lat/lon columns. Expected 'lat'/'latitude' and 'lon'/'longitude'.")
+        st.error("Could not find lat/lon columns.")
         return None
 
     summary_start = ws.max_column + 1
@@ -150,11 +174,9 @@ def process_excel_bytes(file_bytes: bytes, round_to: str) -> bytes:
     for i, name in enumerate(SUMMARY_COLUMNS):
         c = ws.cell(row=1, column=summary_start + i, value=name)
         c.fill = summary_fill; c.font = hdr_font; c.alignment = center
-
     for i, name in enumerate(DETAIL_COLUMNS):
         c = ws.cell(row=1, column=detail_start + i, value=name)
         c.fill = detail_fill; c.font = hdr_font; c.alignment = center
-
     for i, name in enumerate(TAIL_COLUMNS):
         c = ws.cell(row=1, column=tail_start + i, value=name)
         c.fill = summary_fill; c.font = hdr_font; c.alignment = center
@@ -182,11 +204,10 @@ def process_excel_bytes(file_bytes: bytes, round_to: str) -> bytes:
             if row_idx > 1:
                 time.sleep(1)
             result = analyze(lat_f, lon_f)
-        except Exception as e:
+        except Exception:
             write_error(); continue
 
         lf = result["linear_features"]
-
         nearest_dist = None
         nearest_type = None
         for key in FEATURE_KEYS:
@@ -194,7 +215,7 @@ def process_excel_bytes(file_bytes: bytes, round_to: str) -> bytes:
             if d is not None and (nearest_dist is None or d < nearest_dist):
                 nearest_dist = d; nearest_type = key
 
-        nd = _round_dist(nearest_dist, round_to) if nearest_dist is not None else "none within 2km"
+        nd = _round_dist(nearest_dist, decimals) if nearest_dist is not None else "none within 2km"
         ws.cell(row=row_idx + 1, column=summary_start,     value=nd)
         ws.cell(row=row_idx + 1, column=summary_start + 1, value=nearest_type or "none within 2km")
 
@@ -203,14 +224,13 @@ def process_excel_bytes(file_bytes: bytes, round_to: str) -> bytes:
             info = lf.get(key, {})
             dist = info.get("distance_m")
             name = info.get("name")
-            ws.cell(row=row_idx + 1, column=col,     value=_round_dist(dist, round_to) if dist is not None else "none within 2km")
+            ws.cell(row=row_idx + 1, column=col,     value=_round_dist(dist, decimals) if dist is not None else "none within 2km")
             ws.cell(row=row_idx + 1, column=col + 1, value=name or "")
             col += 2
 
         ws.cell(row=row_idx + 1, column=tail_start,     value=result["surface"])
         ws.cell(row=row_idx + 1, column=tail_start + 1, value=result["population"])
 
-    # Auto-size & group detail columns
     all_cols = SUMMARY_COLUMNS + DETAIL_COLUMNS + TAIL_COLUMNS
     for i, name in enumerate(all_cols):
         letter = openpyxl.utils.get_column_letter(summary_start + i)
@@ -223,10 +243,149 @@ def process_excel_bytes(file_bytes: bytes, round_to: str) -> bytes:
     ws.sheet_view.showOutlineSymbols = True
 
     progress.empty()
-
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Coordinate input helpers
+# ---------------------------------------------------------------------------
+
+def _try_parse_pair(text: str):
+    """Return (lat, lon) floats if text looks like 'x,y' or 'x y', else None.
+
+    Also normalises unicode minus signs and rejects out-of-range values so a
+    typo can't produce a pyproj error downstream.
+    """
+    text = text.strip()
+    # Normalise common unicode dashes that copy-paste can introduce
+    text = text.replace("−", "-").replace("–", "-").replace("—", "-")
+    for sep in (",", " ", "\t"):
+        parts = text.split(sep, 1)
+        if len(parts) == 2:
+            try:
+                a = float(parts[0].strip())
+                b = float(parts[1].strip())
+            except ValueError:
+                continue
+            if -90.0 <= a <= 90.0 and -180.0 <= b <= 180.0:
+                return a, b
+    return None
+
+
+def coordinate_input():
+    """
+    Smart coordinate input.
+    - Default: two side-by-side text inputs for lat and lon.
+    - Typing a comma in either field auto-switches to combined mode.
+    - The ⇌ button manually toggles between modes.
+    Returns (lat, lon) floats or (None, None).
+    """
+    if "coord_split" not in st.session_state:
+        st.session_state.coord_split = True
+    if "combined_str" not in st.session_state:
+        st.session_state.combined_str = ""
+
+    input_col, btn_col = st.columns([11, 1])
+
+    with btn_col:
+        st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+        if st.button("⇌", help="Toggle between combined 'lat, lon' input and split inputs"):
+            st.session_state.coord_split = not st.session_state.coord_split
+            st.rerun()
+
+    with input_col:
+        if st.session_state.coord_split:
+            c1, c2 = st.columns(2)
+            with c1:
+                lat_raw = st.text_input("Latitude", value="",
+                                        placeholder="e.g. 40.7128", key="lat_txt")
+            with c2:
+                lon_raw = st.text_input("Longitude", value="",
+                                        placeholder="e.g. -74.0060", key="lon_txt")
+
+            # If the user pasted a full "lat, lon" pair into one field and left
+            # the other empty, accept it in place without switching modes.
+            if lat_raw.strip() and not lon_raw.strip():
+                parsed = _try_parse_pair(lat_raw)
+                if parsed:
+                    return parsed
+            if lon_raw.strip() and not lat_raw.strip():
+                parsed = _try_parse_pair(lon_raw)
+                if parsed:
+                    return parsed
+
+            # Auto-switch to combined mode only if BOTH fields have content and
+            # one contains a comma — that's a clear sign the user is mid-paste
+            # into the wrong layout.
+            if lat_raw.strip() and lon_raw.strip():
+                for raw in (lat_raw, lon_raw):
+                    if "," in raw:
+                        st.session_state.combined_str = raw
+                        st.session_state.coord_split = False
+                        st.rerun()
+
+            # Parse the two separate fields (with bounds checking)
+            lat, lon = None, None
+            if lat_raw.strip():
+                try:
+                    v = float(lat_raw.strip().replace("−", "-"))
+                    if -90.0 <= v <= 90.0:
+                        lat = v
+                    else:
+                        st.caption("⚠️ Latitude out of range (-90 to 90)")
+                except ValueError:
+                    st.caption("⚠️ Invalid latitude")
+            if lon_raw.strip():
+                try:
+                    v = float(lon_raw.strip().replace("−", "-"))
+                    if -180.0 <= v <= 180.0:
+                        lon = v
+                    else:
+                        st.caption("⚠️ Longitude out of range (-180 to 180)")
+                except ValueError:
+                    st.caption("⚠️ Invalid longitude")
+            return lat, lon
+
+        else:
+            raw = st.text_input(
+                "Coordinate  (lat, lon)",
+                value=st.session_state.combined_str,
+                placeholder="Paste e.g.  40.7128, -74.0060",
+                key="combined_input",
+            )
+            st.session_state.combined_str = raw
+            parsed = _try_parse_pair(raw) if raw else None
+            if raw and parsed is None:
+                st.caption("⚠️ Couldn't parse — use format: lat, lon")
+            return (parsed[0], parsed[1]) if parsed else (None, None)
+
+
+# ---------------------------------------------------------------------------
+# Rounding control
+# ---------------------------------------------------------------------------
+
+def rounding_control() -> int:
+    """
+    Returns the number of decimal places to round to (0 = whole meter).
+    UI: checkbox 'Round to whole meter'. If unchecked, a compact slider
+    appears inline letting you pick 1–3 decimal places.
+    """
+    col_check, col_slider = st.columns([2, 3])
+    with col_check:
+        whole = st.checkbox("Round to nearest meter", value=False)
+    if whole:
+        return 0
+    with col_slider:
+        decimals = st.select_slider(
+            "Decimal places",
+            options=[1, 2, 3],
+            value=2,
+            format_func=lambda x: f"0.{'0'*(x-1)}1 m",
+            label_visibility="collapsed",
+        )
+    return decimals
 
 
 # ---------------------------------------------------------------------------
@@ -236,23 +395,14 @@ def process_excel_bytes(file_bytes: bytes, round_to: str) -> bytes:
 st.title("Coordinate Analyzer")
 st.caption("Identifies linear features, surface type, and population density for any US coordinate.")
 
-round_to = st.radio(
-    "Distance rounding",
-    options=["hundredth", "whole"],
-    format_func=lambda x: "Nearest 0.01 m" if x == "hundredth" else "Nearest whole meter",
-    horizontal=True,
-)
+decimals = rounding_control()
 
 st.markdown("---")
 tab_single, tab_excel = st.tabs(["Single Coordinate", "Excel Batch"])
 
 # ---- Single coordinate tab ----
 with tab_single:
-    col1, col2 = st.columns(2)
-    with col1:
-        lat = st.number_input("Latitude", value=None, format="%.6f", placeholder="e.g. 40.712800")
-    with col2:
-        lon = st.number_input("Longitude", value=None, format="%.6f", placeholder="e.g. -74.006000")
+    lat, lon = coordinate_input()
 
     if st.button("Analyze", type="primary", use_container_width=True):
         if lat is None or lon is None:
@@ -262,7 +412,7 @@ with tab_single:
                 try:
                     result = analyze(float(lat), float(lon))
                     st.success(f"Results for **{lat}, {lon}**")
-                    display_results(result, round_to)
+                    display_results(result, decimals)
                 except Exception as e:
                     st.error(f"Analysis failed: {e}")
 
@@ -277,7 +427,7 @@ with tab_excel:
     if uploaded is not None:
         if st.button("Run Analysis", type="primary", use_container_width=True):
             file_bytes = uploaded.read()
-            result_bytes = process_excel_bytes(file_bytes, round_to)
+            result_bytes = process_excel_bytes(file_bytes, decimals)
             if result_bytes:
                 st.success("Done!")
                 st.download_button(
