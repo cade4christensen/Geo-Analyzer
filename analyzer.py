@@ -552,51 +552,67 @@ def _nlcd_hint_with_offset_fallback(lat: float, lon: float) -> Optional[str]:
     return NLCD_POP_HINT.get(dominant)
 
 
+LAST_POP_DEBUG: Dict[str, object] = {}
+
+
 def classify_population(lat: float, lon: float) -> str:
     """Returns Wilderness | Rural | Suburban | Urban."""
+    LAST_POP_DEBUG.clear()
+
     nlcd_hint = _nlcd_hint_with_offset_fallback(lat, lon)
-    print(f"  [pop debug] nlcd_hint={nlcd_hint}")
+    LAST_POP_DEBUG["nlcd_hint"] = nlcd_hint
 
     # Trust NLCD at the top end — NLCD 24 is reliable for high-density urban.
     if nlcd_hint == "Urban":
+        LAST_POP_DEBUG["path"] = "nlcd_hint=Urban shortcut"
         return "Urban"
 
     # Primary signal: 500m radius around the point.
     time.sleep(1)  # gentle rate-limit
     b500_score, b500_count, r500 = _count_buildings_and_roads(lat, lon, 500)
-    print(f"  [pop debug] 500m: score={b500_score} count={b500_count} road={r500}")
+    LAST_POP_DEBUG["b500_score"] = b500_score
+    LAST_POP_DEBUG["b500_count"] = b500_count
+    LAST_POP_DEBUG["r500"] = r500
     if b500_score is None:
+        LAST_POP_DEBUG["path"] = "500m query failed"
         return nlcd_hint or "Wilderness"
 
     # Strong NLCD trust: if offset-sampled NLCD says Suburban, the surrounding
-    # land cover is suburban. Only require minimal OSM evidence that we're not
-    # in a literal empty pixel.
+    # land cover is suburban. Only require minimal OSM evidence.
     if nlcd_hint == "Suburban" and (b500_score >= 0.4 or r500 > 500):
-        # Could still be Urban if OSM density is very high here.
         if b500_score >= 50 or (b500_score >= 25 and r500 > 5000):
+            LAST_POP_DEBUG["path"] = "NLCD-Suburban + high OSM → Urban"
             return "Urban"
+        LAST_POP_DEBUG["path"] = "NLCD-Suburban + any OSM → Suburban"
         return "Suburban"
 
     result = _classify_from_signals(b500_score, r500, nlcd_hint)
-    print(f"  [pop debug] 500m result={result}")
+    LAST_POP_DEBUG["primary_result"] = result
 
     # Wider 1000m context — same OSM-based fallback as before.
     if result in ("Rural", "Wilderness"):
         time.sleep(1)
         b1000_score, b1000_count, r1000 = _count_buildings_and_roads(lat, lon, 1000)
-        print(f"  [pop debug] 1000m: score={b1000_score} count={b1000_count} road={r1000}")
+        LAST_POP_DEBUG["b1000_score"] = b1000_score
+        LAST_POP_DEBUG["b1000_count"] = b1000_count
+        LAST_POP_DEBUG["r1000"] = r1000
         if b1000_count is not None:
             if b1000_count >= 30 and r1000 > 3500:
+                LAST_POP_DEBUG["path"] = "wider: 30+ buildings + 3500m road → Suburban"
                 return "Suburban"
             if b1000_count >= 60:
+                LAST_POP_DEBUG["path"] = "wider: 60+ buildings → Suburban"
                 return "Suburban"
             if nlcd_hint in ("Suburban", "Urban") and (
                 b1000_count >= 5 or (r1000 or 0) > 2000
             ):
+                LAST_POP_DEBUG["path"] = "wider: NLCD-developed + any OSM → Suburban"
                 return "Suburban"
             if result == "Wilderness" and b1000_count >= 3:
+                LAST_POP_DEBUG["path"] = "wider: Wilderness + 3+ buildings → Rural"
                 return "Rural"
 
+    LAST_POP_DEBUG["path"] = f"final fallthrough → {result}"
     return result
 
 # ---------------------------------------------------------------------------
@@ -637,6 +653,7 @@ def analyze(lat: float, lon: float) -> dict:
         "coordinate":      {"lat": lat, "lon": lon},
         "linear_features": linear,
         "surface":         surface,
+        "_pop_debug":      dict(LAST_POP_DEBUG),
         "population":      population,
     }
 

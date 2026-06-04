@@ -126,6 +126,12 @@ def display_results(result: dict, decimals: int):
         })
     st.table(rows)
 
+    # Debug info: surfaces the signals that drove the population decision
+    pop_debug = result.get("_pop_debug") or {}
+    if pop_debug:
+        with st.expander("Population signal debug"):
+            st.json(pop_debug)
+
 
 # ---------------------------------------------------------------------------
 # Excel processing
