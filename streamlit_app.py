@@ -76,7 +76,6 @@ SURFACE_COLOR = {
     "Woods":     "#22c55e",
     "Scrub":     "#84cc16",
     "Field":     "#eab308",
-    "Brush":     "#a3e635",
     "Rock":      "#d1d5db",
     "Unknown":   "#6b7280",
 }

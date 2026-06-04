@@ -1,6 +1,0 @@
-requests
-shapely
-pyproj
-rasterio
-openpyxl
-streamlit
