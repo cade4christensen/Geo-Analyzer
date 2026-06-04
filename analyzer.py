@@ -444,85 +444,119 @@ def _get_nlcd_value(lat: float, lon: float) -> Optional[int]:
 # 3. Population
 # ---------------------------------------------------------------------------
 
+def _count_buildings_and_roads(lat: float, lon: float, radius_m: int):
+    """
+    Query Overpass for buildings + roads within `radius_m`. Returns
+    (building_score, building_count, clipped_road_length_m) where:
+      - building_score weights ambiguous "yes" tags at 0.3 (confidence-adjusted)
+      - building_count is the raw count of non-outbuilding structures
+      - clipped_road_length_m is highway length intersected with the radius
+    Returns (None, None, None) on failure.
+    """
+    ql = f"""
+[out:json][timeout:30];
+(
+  way["building"](around:{radius_m},{lat},{lon});
+  way["highway"~"motorway|trunk|primary|secondary|tertiary|residential|unclassified"](around:{radius_m},{lat},{lon});
+);
+out geom;
+"""
+    try:
+        data = _query_overpass(ql)
+    except Exception:
+        return None, None, None
+
+    transformer = _utm_transformer(lat, lon)
+    px, py = _to_utm(transformer, lon, lat)
+    point_utm = Point(px, py)
+    buffer_poly = point_utm.buffer(radius_m)
+
+    building_score = 0.0
+    building_count = 0
+    clipped_road_length_m = 0.0
+    for el in data.get("elements", []):
+        tags = el.get("tags", {})
+        bval = tags.get("building", "")
+        if bval:
+            if bval in _OUTBUILDING:
+                continue
+            building_count += 1
+            if bval in _OCCUPIED:
+                building_score += 1.0
+            else:
+                building_score += 0.3
+        elif tags.get("highway"):
+            ls = _way_to_linestring_utm(el, transformer)
+            if ls:
+                clipped_road_length_m += ls.intersection(buffer_poly).length
+
+    return building_score, building_count, clipped_road_length_m
+
+
+def _classify_from_signals(building_score: float, clipped_road_length_m: float,
+                           nlcd_hint: Optional[str]) -> str:
+    """Pure tiered classification from already-computed 500m signals."""
+    if building_score >= 50:
+        return "Urban"
+    if building_score >= 25 and clipped_road_length_m > 5000:
+        return "Urban"
+    if building_score >= 3 and clipped_road_length_m > 1500:
+        return "Suburban"
+    if building_score >= 1 and clipped_road_length_m > 2500:
+        return "Suburban"
+    if building_score >= 0.4 and clipped_road_length_m > 4000:
+        return "Suburban"
+    if building_score >= 5 and nlcd_hint in ("Suburban", "Urban"):
+        return "Suburban"
+    if building_score >= 0.4:
+        return "Rural"
+
+    # Road-only fallback when buildings are absent.
+    if clipped_road_length_m > 6000:
+        return "Suburban" if nlcd_hint else "Rural"
+    if clipped_road_length_m > 2500 and nlcd_hint:
+        return "Suburban" if nlcd_hint != "Rural" else "Rural"
+    if clipped_road_length_m > 1000 and nlcd_hint:
+        return "Rural"
+
+    return nlcd_hint or "Wilderness"
+
+
 def classify_population(lat: float, lon: float) -> str:
     """Returns Wilderness | Rural | Suburban | Urban."""
     nlcd_val = _get_nlcd_value(lat, lon)
     nlcd_hint = NLCD_POP_HINT.get(nlcd_val)
 
-    # Trust NLCD only at the very top end — high-intensity developed is rarely
-    # spurious. Lower developed classes get checked against OSM signal below.
+    # Trust NLCD at the top end — NLCD 24 is reliable for high-density urban.
     if nlcd_hint == "Urban":
         return "Urban"
 
-    # Inner 100 m presence test. If nothing is mapped here, the broader 500 m
-    # ring is just neighbours across water/hills/etc. — return Wilderness early.
-    ql_inner = f"""
-[out:json][timeout:15];
-(
-  way["building"](around:100,{lat},{lon});
-  way["highway"~"motorway|trunk|primary|secondary|tertiary|residential|unclassified"](around:100,{lat},{lon});
-);
-out ids;
-"""
-    try:
-        inner = _query_overpass(ql_inner)
-        if not inner.get("elements"):
-            return "Wilderness"
-    except Exception:
-        pass  # fall through to the full query
-
-    # Full 500 m count. Service roads excluded — rural properties have many
-    # driveways and parking aisles that inflate road density.
-    ql = f"""
-[out:json][timeout:30];
-(
-  way["building"~"yes|house|residential|apartments|commercial|retail|industrial|office|school|church|hospital|hotel|warehouse"](around:500,{lat},{lon});
-  way["highway"~"motorway|trunk|primary|secondary|tertiary|residential|unclassified"](around:500,{lat},{lon});
-);
-out geom;
-"""
+    # Primary signal: 500m radius around the point.
     time.sleep(1)  # gentle rate-limit
-    try:
-        data = _query_overpass(ql)
-    except Exception:
+    b500_score, b500_count, r500 = _count_buildings_and_roads(lat, lon, 500)
+    if b500_score is None:
         return nlcd_hint or "Wilderness"
 
-    transformer = _utm_transformer(lat, lon)
-    px, py = _to_utm(transformer, lon, lat)
-    point_utm = Point(px, py)
-    buffer_500 = point_utm.buffer(500)
+    result = _classify_from_signals(b500_score, r500, nlcd_hint)
 
-    building_score = 0.0
-    clipped_road_length_m = 0.0
+    # If the 500m view says Rural or Wilderness, look at a wider 1000m context.
+    # Use raw building count (not weighted score) — for the "am I inside a
+    # suburb?" question, mapped structure count matters more than tag quality.
+    if result in ("Rural", "Wilderness"):
+        time.sleep(1)
+        b1000_score, b1000_count, r1000 = _count_buildings_and_roads(lat, lon, 1000)
+        if b1000_count is not None:
+            # 1000m circle ≈ 314 ha. Suburban density at this scale is
+            # 30+ mapped buildings with a meaningful road grid, or 60+
+            # buildings alone.
+            if b1000_count >= 30 and r1000 > 3500:
+                return "Suburban"
+            if b1000_count >= 60:
+                return "Suburban"
+            if result == "Wilderness" and b1000_count >= 3:
+                return "Rural"
 
-    for el in data.get("elements", []):
-        tags = el.get("tags", {})
-        bval = tags.get("building", "")
-        if bval:
-            if bval in _OCCUPIED:
-                building_score += 1.0
-            elif bval not in _OUTBUILDING:
-                building_score += 0.2  # ambiguous "yes" — fractional weight
-        elif tags.get("highway"):
-            ls = _way_to_linestring_utm(el, transformer)
-            if ls:
-                clipped_road_length_m += ls.intersection(buffer_500).length
-
-    if building_score >= 60:
-        return "Urban"
-    if building_score >= 15:
-        return "Suburban"
-    if building_score >= 2:
-        return "Rural"
-
-    if clipped_road_length_m > 6000:
-        return "Urban"
-    if clipped_road_length_m > 2500:
-        return "Suburban"
-    if clipped_road_length_m > 300:
-        return "Rural"
-
-    return nlcd_hint or "Wilderness"
+    return result
 
 # ---------------------------------------------------------------------------
 # Public API
