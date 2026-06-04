@@ -33,32 +33,35 @@ NLCD_WCS_URL = "https://www.mrlc.gov/geoserver/mrlc_display/NLCD_2021_Land_Cover
 
 # Cascade of free authoritative US road datasets — tried in order when OSM is
 # sparse. Each is queried via ArcGIS REST; the closer-than-threshold result wins.
-TIGER_ROADS_URL = ("https://tigerweb.geo.census.gov/arcgis/rest/services/"
-                   "TIGERweb/Transportation/MapServer/18/query")
-USFS_ROADS_URL  = ("https://apps.fs.usda.gov/arcx/rest/services/EDW/"
-                   "EDW_RoadBasic_01/MapServer/0/query")
-USGS_ROADS_URL  = ("https://carto.nationalmap.gov/arcgis/rest/services/"
-                   "transportation/MapServer/2/query")
+_TIGER_BASE = ("https://tigerweb.geo.census.gov/arcgis/rest/services/"
+               "TIGERweb/Transportation/MapServer")
+_USFS_BASE  = ("https://apps.fs.usda.gov/arcx/rest/services/EDW/"
+               "EDW_RoadBasic_01/MapServer")
+_USGS_BASE  = ("https://carto.nationalmap.gov/arcgis/rest/services/"
+               "transportation/MapServer")
 
-# TIGER MTFCC codes that count as drivable Roads. S17xx are walkways/stairs/etc.
-_TIGER_ROAD_MTFCC = {
-    "S1100",  # Primary Road
-    "S1200",  # Secondary Road
-    "S1400",  # Local Neighborhood Road, Rural Road, City Street
-    "S1500",  # Vehicular Trail (4WD)
-    "S1630",  # Ramp
-    "S1640",  # Service Drive along limited-access highway
-    "S1730",  # Alley
-    "S1740",  # Private Road for service vehicles (logging, oil fields, etc.)
-}
-
-# Cascade of (threshold_m, source_label, query_url, mtfcc_filter). The cascade
-# stops as soon as the current best road distance is <= the next threshold —
-# saves repeated HTTP calls when OSM already returned a close match.
-_ROAD_FALLBACK_CASCADE = [
-    (500, "TIGER", TIGER_ROADS_URL, _TIGER_ROAD_MTFCC),
-    (300, "USFS",  USFS_ROADS_URL,  None),
-    (200, "USGS",  USGS_ROADS_URL,  None),
+# Each dataset is (label, threshold_m, [list of query URLs to merge]).
+# The cascade stops once the running-best distance <= the next dataset's
+# threshold, saving HTTP calls when OSM/TIGER already returned a close match.
+_ROAD_DATASETS = [
+    (
+        "TIGER", 500, [
+            f"{_TIGER_BASE}/8/query",   # Local Roads — most comprehensive in rural areas
+        ],
+    ),
+    (
+        "USFS", 300, [
+            f"{_USFS_BASE}/0/query",    # National Forest System Roads
+        ],
+    ),
+    (
+        "USGS", 200, [
+            f"{_USGS_BASE}/32/query",   # Local Roads
+            f"{_USGS_BASE}/35/query",   # 4WD Roads — logging / forest spurs
+            f"{_USGS_BASE}/31/query",   # Local Connecting Roads
+            f"{_USGS_BASE}/30/query",   # Secondary Highways
+        ],
+    ),
 ]
 
 # Property-name candidates for the road's name across the different datasets.
@@ -251,7 +254,7 @@ def _extract_road_name(props: dict) -> Optional[str]:
 
 def _arcgis_query_nearest_road(
     url: str, lat: float, lon: float, transformer: Transformer,
-    point_utm: Point, radius_m: int, mtfcc_filter: Optional[set] = None,
+    point_utm: Point, radius_m: int,
 ) -> Optional[Tuple[float, Optional[str]]]:
     """
     Generic ArcGIS REST roads query — works for TIGER, USFS, USGS NTD.
@@ -285,9 +288,6 @@ def _arcgis_query_nearest_road(
 
     for feat in data.get("features", []):
         props = feat.get("properties") or {}
-        if mtfcc_filter and props.get("MTFCC", "") not in mtfcc_filter:
-            continue
-
         geom = feat.get("geometry") or {}
         gtype = geom.get("type")
         if gtype == "LineString":
@@ -320,25 +320,23 @@ def _cascade_nearest_road(
     radius_m: int, starting_best: Optional[Tuple[float, Optional[str], str]] = None,
 ) -> Optional[Tuple[float, Optional[str], str]]:
     """
-    Walk the TIGER→USFS→USGS cascade. Stops early as soon as `starting_best`
-    (or the current winner) is already within the next dataset's threshold —
-    avoids unnecessary HTTP calls when OSM already returned a tight match.
-    Returns (distance_m, name, source) or `starting_best` if nothing improves.
+    Walk TIGER → USFS → USGS NTD. Stops as soon as the running winner is
+    already within the next dataset's threshold. Returns (dist, name, source).
     """
     best = starting_best  # (dist, name, source) or None
 
-    for threshold, label, url, mtfcc in _ROAD_FALLBACK_CASCADE:
-        # Skip this and remaining sources if we're already inside threshold.
+    for label, threshold, urls in _ROAD_DATASETS:
         if best is not None and best[0] <= threshold:
             break
-        result = _arcgis_query_nearest_road(
-            url, lat, lon, transformer, point_utm, radius_m, mtfcc
-        )
-        if result is None:
-            continue
-        d, name = result
-        if best is None or d < best[0]:
-            best = (d, name, label)
+        for url in urls:
+            result = _arcgis_query_nearest_road(
+                url, lat, lon, transformer, point_utm, radius_m
+            )
+            if result is None:
+                continue
+            d, name = result
+            if best is None or d < best[0]:
+                best = (d, name, label)
 
     return best
 
