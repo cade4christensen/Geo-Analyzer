@@ -555,6 +555,7 @@ def _nlcd_hint_with_offset_fallback(lat: float, lon: float) -> Optional[str]:
 def classify_population(lat: float, lon: float) -> str:
     """Returns Wilderness | Rural | Suburban | Urban."""
     nlcd_hint = _nlcd_hint_with_offset_fallback(lat, lon)
+    print(f"  [pop debug] nlcd_hint={nlcd_hint}")
 
     # Trust NLCD at the top end — NLCD 24 is reliable for high-density urban.
     if nlcd_hint == "Urban":
@@ -563,28 +564,34 @@ def classify_population(lat: float, lon: float) -> str:
     # Primary signal: 500m radius around the point.
     time.sleep(1)  # gentle rate-limit
     b500_score, b500_count, r500 = _count_buildings_and_roads(lat, lon, 500)
+    print(f"  [pop debug] 500m: score={b500_score} count={b500_count} road={r500}")
     if b500_score is None:
         return nlcd_hint or "Wilderness"
 
-    result = _classify_from_signals(b500_score, r500, nlcd_hint)
+    # Strong NLCD trust: if offset-sampled NLCD says Suburban, the surrounding
+    # land cover is suburban. Only require minimal OSM evidence that we're not
+    # in a literal empty pixel.
+    if nlcd_hint == "Suburban" and (b500_score >= 0.4 or r500 > 500):
+        # Could still be Urban if OSM density is very high here.
+        if b500_score >= 50 or (b500_score >= 25 and r500 > 5000):
+            return "Urban"
+        return "Suburban"
 
-    # If the 500m view says Rural or Wilderness, look at a wider 1000m context.
-    # Use raw building count (not weighted score) — for the "am I inside a
-    # suburb?" question, mapped structure count matters more than tag quality.
+    result = _classify_from_signals(b500_score, r500, nlcd_hint)
+    print(f"  [pop debug] 500m result={result}")
+
+    # Wider 1000m context — same OSM-based fallback as before.
     if result in ("Rural", "Wilderness"):
         time.sleep(1)
         b1000_score, b1000_count, r1000 = _count_buildings_and_roads(lat, lon, 1000)
+        print(f"  [pop debug] 1000m: score={b1000_score} count={b1000_count} road={r1000}")
         if b1000_count is not None:
-            # 1000m circle ≈ 314 ha.
             if b1000_count >= 30 and r1000 > 3500:
                 return "Suburban"
             if b1000_count >= 60:
                 return "Suburban"
-            # NLCD trust: if offset-sampled NLCD says Suburban/Urban AND there's
-            # ANY OSM evidence of buildings or roads nearby, trust NLCD.
-            # Catches lake/park points in suburbs that are under-mapped in OSM.
             if nlcd_hint in ("Suburban", "Urban") and (
-                (b1000_count or 0) >= 5 or (r1000 or 0) > 2000
+                b1000_count >= 5 or (r1000 or 0) > 2000
             ):
                 return "Suburban"
             if result == "Wilderness" and b1000_count >= 3:
