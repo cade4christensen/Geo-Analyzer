@@ -495,11 +495,15 @@ out geom;
 
 
 def _classify_from_signals(building_score: float, clipped_road_length_m: float,
-                           nlcd_hint: Optional[str]) -> str:
+                           nlcd_hint: Optional[str],
+                           building_count: int = 0) -> str:
     """Pure tiered classification from already-computed 500m signals."""
-    if building_score >= 50:
+    # Urban requires very dense built environment. A single highway running
+    # through a suburb shouldn't promote — use raw building count for the
+    # density check rather than the road length.
+    if building_count >= 250:
         return "Urban"
-    if building_score >= 25 and clipped_road_length_m > 5000:
+    if building_score >= 70:
         return "Urban"
     if building_score >= 3 and clipped_road_length_m > 1500:
         return "Suburban"
@@ -580,13 +584,13 @@ def classify_population(lat: float, lon: float) -> str:
     # Strong NLCD trust: if offset-sampled NLCD says Suburban, the surrounding
     # land cover is suburban. Only require minimal OSM evidence.
     if nlcd_hint == "Suburban" and (b500_score >= 0.4 or r500 > 500):
-        if b500_score >= 50 or (b500_score >= 25 and r500 > 5000):
+        if b500_count >= 250 or b500_score >= 70:
             LAST_POP_DEBUG["path"] = "NLCD-Suburban + high OSM → Urban"
             return "Urban"
         LAST_POP_DEBUG["path"] = "NLCD-Suburban + any OSM → Suburban"
         return "Suburban"
 
-    result = _classify_from_signals(b500_score, r500, nlcd_hint)
+    result = _classify_from_signals(b500_score, r500, nlcd_hint, b500_count)
     LAST_POP_DEBUG["primary_result"] = result
 
     # Wider 1000m context — same OSM-based fallback as before.
