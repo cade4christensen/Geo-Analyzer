@@ -31,10 +31,14 @@ OVERPASS_ENDPOINTS = [
 
 NLCD_WCS_URL = "https://www.mrlc.gov/geoserver/mrlc_display/NLCD_2021_Land_Cover_L48/ows"
 
-# US Census TIGER roads — fallback when OSM road coverage is sparse (rural / forest).
-# Layer 18 of the TIGERweb Transportation service is "All Roads".
+# Cascade of free authoritative US road datasets — tried in order when OSM is
+# sparse. Each is queried via ArcGIS REST; the closer-than-threshold result wins.
 TIGER_ROADS_URL = ("https://tigerweb.geo.census.gov/arcgis/rest/services/"
                    "TIGERweb/Transportation/MapServer/18/query")
+USFS_ROADS_URL  = ("https://apps.fs.usda.gov/arcx/rest/services/EDW/"
+                   "EDW_RoadBasic_01/MapServer/0/query")
+USGS_ROADS_URL  = ("https://carto.nationalmap.gov/arcgis/rest/services/"
+                   "transportation/MapServer/2/query")
 
 # TIGER MTFCC codes that count as drivable Roads. S17xx are walkways/stairs/etc.
 _TIGER_ROAD_MTFCC = {
@@ -47,6 +51,21 @@ _TIGER_ROAD_MTFCC = {
     "S1730",  # Alley
     "S1740",  # Private Road for service vehicles (logging, oil fields, etc.)
 }
+
+# Cascade of (threshold_m, source_label, query_url, mtfcc_filter). The cascade
+# stops as soon as the current best road distance is <= the next threshold —
+# saves repeated HTTP calls when OSM already returned a close match.
+_ROAD_FALLBACK_CASCADE = [
+    (500, "TIGER", TIGER_ROADS_URL, _TIGER_ROAD_MTFCC),
+    (300, "USFS",  USFS_ROADS_URL,  None),
+    (200, "USGS",  USGS_ROADS_URL,  None),
+]
+
+# Property-name candidates for the road's name across the different datasets.
+_NAME_FIELD_CANDIDATES = (
+    "FULLNAME", "NAME", "RD_NAME", "ROAD_NAME", "RTE_NM", "FULL_NAME",
+    "STREETNAME", "STREET",
+)
 
 # Overpass rejects the default `python-requests/X` UA with 406. Don't set an
 # Accept header — Overpass returns XML on error and a strict Accept turns
@@ -218,36 +237,43 @@ def _classify_linear_tag(tags: dict) -> Optional[str]:
     return None
 
 # ---------------------------------------------------------------------------
-# TIGER (US Census) roads fallback
+# US road-data fallback cascade (TIGER → USFS → USGS NTD)
 # ---------------------------------------------------------------------------
 
-def _nearest_tiger_road(lat: float, lon: float, transformer: Transformer,
-                        point_utm: Point, radius_m: int) -> Optional[Tuple[float, Optional[str]]]:
+def _extract_road_name(props: dict) -> Optional[str]:
+    """Pick the most-name-looking value across the various dataset schemas."""
+    for f in _NAME_FIELD_CANDIDATES:
+        v = props.get(f)
+        if v and str(v).strip() and str(v).strip().lower() not in ("none", "null"):
+            return str(v).strip()
+    return None
+
+
+def _arcgis_query_nearest_road(
+    url: str, lat: float, lon: float, transformer: Transformer,
+    point_utm: Point, radius_m: int, mtfcc_filter: Optional[set] = None,
+) -> Optional[Tuple[float, Optional[str]]]:
     """
-    Query the US Census TIGER All-Roads layer for road segments within a
-    radius_m bounding box and return (distance_m, name) of the nearest
-    drivable road, or None if nothing found or the service errored.
+    Generic ArcGIS REST roads query — works for TIGER, USFS, USGS NTD.
+    Returns (distance_m, name) of the nearest segment in the bbox, or None.
     """
-    # Bounding box in degrees, sized for radius_m at this latitude.
     dlat = radius_m / 111320.0
     dlon = radius_m / (111320.0 * max(math.cos(math.radians(lat)), 1e-3))
-    xmin, ymin = lon - dlon, lat - dlat
-    xmax, ymax = lon + dlon, lat + dlat
+    bbox = f"{lon - dlon},{lat - dlat},{lon + dlon},{lat + dlat}"
 
     params = {
         "where":          "1=1",
-        "geometry":       f"{xmin},{ymin},{xmax},{ymax}",
+        "geometry":       bbox,
         "geometryType":   "esriGeometryEnvelope",
         "inSR":           "4326",
         "outSR":          "4326",
         "spatialRel":     "esriSpatialRelIntersects",
-        "outFields":      "FULLNAME,MTFCC",
+        "outFields":      "*",
         "returnGeometry": "true",
         "f":              "geojson",
     }
     try:
-        r = requests.get(TIGER_ROADS_URL, params=params,
-                         headers=HTTP_HEADERS, timeout=30)
+        r = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=20)
         if r.status_code != 200:
             return None
         data = r.json()
@@ -259,13 +285,11 @@ def _nearest_tiger_road(lat: float, lon: float, transformer: Transformer,
 
     for feat in data.get("features", []):
         props = feat.get("properties") or {}
-        mtfcc = props.get("MTFCC", "")
-        if mtfcc not in _TIGER_ROAD_MTFCC:
+        if mtfcc_filter and props.get("MTFCC", "") not in mtfcc_filter:
             continue
 
         geom = feat.get("geometry") or {}
         gtype = geom.get("type")
-        coord_lists = []
         if gtype == "LineString":
             coord_lists = [geom.get("coordinates") or []]
         elif gtype == "MultiLineString":
@@ -276,16 +300,47 @@ def _nearest_tiger_road(lat: float, lon: float, transformer: Transformer,
         for coords in coord_lists:
             if len(coords) < 2:
                 continue
-            utm_coords = [_to_utm(transformer, c[0], c[1]) for c in coords]
-            ls = LineString(utm_coords)
-            d = point_utm.distance(ls)
+            try:
+                utm_coords = [_to_utm(transformer, c[0], c[1]) for c in coords]
+                ls = LineString(utm_coords)
+                d = point_utm.distance(ls)
+            except Exception:
+                continue
             if nearest_dist is None or d < nearest_dist:
                 nearest_dist = d
-                nearest_name = props.get("FULLNAME") or None
+                nearest_name = _extract_road_name(props)
 
     if nearest_dist is None:
         return None
     return nearest_dist, nearest_name
+
+
+def _cascade_nearest_road(
+    lat: float, lon: float, transformer: Transformer, point_utm: Point,
+    radius_m: int, starting_best: Optional[Tuple[float, Optional[str], str]] = None,
+) -> Optional[Tuple[float, Optional[str], str]]:
+    """
+    Walk the TIGER→USFS→USGS cascade. Stops early as soon as `starting_best`
+    (or the current winner) is already within the next dataset's threshold —
+    avoids unnecessary HTTP calls when OSM already returned a tight match.
+    Returns (distance_m, name, source) or `starting_best` if nothing improves.
+    """
+    best = starting_best  # (dist, name, source) or None
+
+    for threshold, label, url, mtfcc in _ROAD_FALLBACK_CASCADE:
+        # Skip this and remaining sources if we're already inside threshold.
+        if best is not None and best[0] <= threshold:
+            break
+        result = _arcgis_query_nearest_road(
+            url, lat, lon, transformer, point_utm, radius_m, mtfcc
+        )
+        if result is None:
+            continue
+        d, name = result
+        if best is None or d < best[0]:
+            best = (d, name, label)
+
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -328,18 +383,18 @@ def find_nearest_linear_features(lat: float, lon: float, radius_m: int = 2000) -
             results[label]["name"] = tags.get("name") or tags.get("ref")
             results[label]["source"] = "OSM"
 
-    # TIGER fallback for the Road category when OSM coverage is sparse in
-    # rural / forest areas. Only fires when OSM's nearest Road is > 500m or
-    # missing entirely. US-only data; harmless no-op outside the US.
-    osm_road_dist = results["Road"]["distance_m"]
-    if osm_road_dist is None or osm_road_dist > 500:
-        tiger = _nearest_tiger_road(lat, lon, transformer, point_utm, radius_m)
-        if tiger is not None:
-            tdist, tname = tiger
-            if osm_road_dist is None or tdist < osm_road_dist:
-                results["Road"]["distance_m"] = round(tdist, 1)
-                results["Road"]["name"] = tname
-                results["Road"]["source"] = "TIGER"
+    # Cascading Road fallback when OSM coverage is sparse: TIGER → USFS → USGS NTD.
+    # Each only fires if the current best distance is still above its threshold.
+    # US-only data; outside the US these all silently no-op.
+    osm_dist = results["Road"]["distance_m"]
+    if osm_dist is None or osm_dist > 500:
+        starting = (osm_dist, results["Road"]["name"], "OSM") if osm_dist is not None else None
+        best = _cascade_nearest_road(lat, lon, transformer, point_utm, radius_m, starting)
+        if best is not None:
+            d, name, source = best
+            results["Road"]["distance_m"] = round(d, 1)
+            results["Road"]["name"] = name
+            results["Road"]["source"] = source
 
     return results
 
