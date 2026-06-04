@@ -31,6 +31,23 @@ OVERPASS_ENDPOINTS = [
 
 NLCD_WCS_URL = "https://www.mrlc.gov/geoserver/mrlc_display/NLCD_2021_Land_Cover_L48/ows"
 
+# US Census TIGER roads — fallback when OSM road coverage is sparse (rural / forest).
+# Layer 18 of the TIGERweb Transportation service is "All Roads".
+TIGER_ROADS_URL = ("https://tigerweb.geo.census.gov/arcgis/rest/services/"
+                   "TIGERweb/Transportation/MapServer/18/query")
+
+# TIGER MTFCC codes that count as drivable Roads. S17xx are walkways/stairs/etc.
+_TIGER_ROAD_MTFCC = {
+    "S1100",  # Primary Road
+    "S1200",  # Secondary Road
+    "S1400",  # Local Neighborhood Road, Rural Road, City Street
+    "S1500",  # Vehicular Trail (4WD)
+    "S1630",  # Ramp
+    "S1640",  # Service Drive along limited-access highway
+    "S1730",  # Alley
+    "S1740",  # Private Road for service vehicles (logging, oil fields, etc.)
+}
+
 # Overpass rejects the default `python-requests/X` UA with 406. Don't set an
 # Accept header — Overpass returns XML on error and a strict Accept turns
 # every error into another 406.
@@ -201,13 +218,85 @@ def _classify_linear_tag(tags: dict) -> Optional[str]:
     return None
 
 # ---------------------------------------------------------------------------
+# TIGER (US Census) roads fallback
+# ---------------------------------------------------------------------------
+
+def _nearest_tiger_road(lat: float, lon: float, transformer: Transformer,
+                        point_utm: Point, radius_m: int) -> Optional[Tuple[float, Optional[str]]]:
+    """
+    Query the US Census TIGER All-Roads layer for road segments within a
+    radius_m bounding box and return (distance_m, name) of the nearest
+    drivable road, or None if nothing found or the service errored.
+    """
+    # Bounding box in degrees, sized for radius_m at this latitude.
+    dlat = radius_m / 111320.0
+    dlon = radius_m / (111320.0 * max(math.cos(math.radians(lat)), 1e-3))
+    xmin, ymin = lon - dlon, lat - dlat
+    xmax, ymax = lon + dlon, lat + dlat
+
+    params = {
+        "where":          "1=1",
+        "geometry":       f"{xmin},{ymin},{xmax},{ymax}",
+        "geometryType":   "esriGeometryEnvelope",
+        "inSR":           "4326",
+        "outSR":          "4326",
+        "spatialRel":     "esriSpatialRelIntersects",
+        "outFields":      "FULLNAME,MTFCC",
+        "returnGeometry": "true",
+        "f":              "geojson",
+    }
+    try:
+        r = requests.get(TIGER_ROADS_URL, params=params,
+                         headers=HTTP_HEADERS, timeout=30)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception:
+        return None
+
+    nearest_dist: Optional[float] = None
+    nearest_name: Optional[str] = None
+
+    for feat in data.get("features", []):
+        props = feat.get("properties") or {}
+        mtfcc = props.get("MTFCC", "")
+        if mtfcc not in _TIGER_ROAD_MTFCC:
+            continue
+
+        geom = feat.get("geometry") or {}
+        gtype = geom.get("type")
+        coord_lists = []
+        if gtype == "LineString":
+            coord_lists = [geom.get("coordinates") or []]
+        elif gtype == "MultiLineString":
+            coord_lists = geom.get("coordinates") or []
+        else:
+            continue
+
+        for coords in coord_lists:
+            if len(coords) < 2:
+                continue
+            utm_coords = [_to_utm(transformer, c[0], c[1]) for c in coords]
+            ls = LineString(utm_coords)
+            d = point_utm.distance(ls)
+            if nearest_dist is None or d < nearest_dist:
+                nearest_dist = d
+                nearest_name = props.get("FULLNAME") or None
+
+    if nearest_dist is None:
+        return None
+    return nearest_dist, nearest_name
+
+
+# ---------------------------------------------------------------------------
 # 1. Nearest linear features
 # ---------------------------------------------------------------------------
 
 def find_nearest_linear_features(lat: float, lon: float, radius_m: int = 2000) -> dict:
     """
-    Returns {label: {"distance_m": float|None, "name": str|None}} for each
-    linear-feature class. None means no feature of that type within radius_m.
+    Returns {label: {"distance_m": float|None, "name": str|None, "source": str|None}}
+    for each linear-feature class. None means no feature within radius_m.
+    Sources: "OSM" (default), "TIGER" (US Census roads, fallback when OSM is sparse).
     """
     transformer = _utm_transformer(lat, lon)
     px, py = _to_utm(transformer, lon, lat)
@@ -219,7 +308,8 @@ def find_nearest_linear_features(lat: float, lon: float, radius_m: int = 2000) -
     ql = f"[out:json][timeout:50];\n(\n{''.join(parts)}\n);\nout geom;"
 
     data = _query_overpass(ql)
-    results = {label: {"distance_m": None, "name": None} for label in LINEAR_FILTERS}
+    results = {label: {"distance_m": None, "name": None, "source": None}
+               for label in LINEAR_FILTERS}
 
     for el in data.get("elements", []):
         if el.get("type") not in ("way", "relation"):
@@ -236,6 +326,20 @@ def find_nearest_linear_features(lat: float, lon: float, radius_m: int = 2000) -
         if current is None or dist < current:
             results[label]["distance_m"] = round(dist, 1)
             results[label]["name"] = tags.get("name") or tags.get("ref")
+            results[label]["source"] = "OSM"
+
+    # TIGER fallback for the Road category when OSM coverage is sparse in
+    # rural / forest areas. Only fires when OSM's nearest Road is > 500m or
+    # missing entirely. US-only data; harmless no-op outside the US.
+    osm_road_dist = results["Road"]["distance_m"]
+    if osm_road_dist is None or osm_road_dist > 500:
+        tiger = _nearest_tiger_road(lat, lon, transformer, point_utm, radius_m)
+        if tiger is not None:
+            tdist, tname = tiger
+            if osm_road_dist is None or tdist < osm_road_dist:
+                results["Road"]["distance_m"] = round(tdist, 1)
+                results["Road"]["name"] = tname
+                results["Road"]["source"] = "TIGER"
 
     return results
 

@@ -119,9 +119,14 @@ def display_results(result: dict, decimals: int):
         info = lf.get(key, {})
         dist = info.get("distance_m")
         name = info.get("name") or ""
+        source = info.get("source")
+        dist_str = fmt_dist(dist, decimals)
+        # Tag the cell when a non-default data source was used (e.g. TIGER fallback).
+        if source and source != "OSM" and dist is not None:
+            dist_str = f"{dist_str} ({source})"
         rows.append({
             "Feature":    key,
-            "Distance":   fmt_dist(dist, decimals),
+            "Distance":   dist_str,
             "Name / Ref": name,
         })
     st.table(rows)
