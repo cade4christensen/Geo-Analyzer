@@ -39,6 +39,8 @@ _USFS_BASE  = ("https://apps.fs.usda.gov/arcx/rest/services/EDW/"
                "EDW_RoadBasic_01/MapServer")
 _USGS_BASE  = ("https://carto.nationalmap.gov/arcgis/rest/services/"
                "transportation/MapServer")
+_WADNR_BASE = ("https://gis.dnr.wa.gov/site3/rest/services/"
+               "Public_Transportation/WADNR_PUBLIC_ENG_Roads/MapServer")
 
 # Each dataset is (label, threshold_m, [list of query URLs to merge]).
 # The cascade stops once the running-best distance <= the next dataset's
@@ -60,6 +62,15 @@ _ROAD_DATASETS = [
             f"{_USGS_BASE}/35/query",   # 4WD Roads — logging / forest spurs
             f"{_USGS_BASE}/31/query",   # Local Connecting Roads
             f"{_USGS_BASE}/30/query",   # Secondary Highways
+        ],
+    ),
+    (
+        # WA-only state forest land roads (active DNR-managed roads,
+        # including forest spurs not in federal datasets). Silently no-ops
+        # outside Washington.
+        "WA_DNR", 150, [
+            f"{_WADNR_BASE}/5/query",   # Active Roads (full detail)
+            f"{_WADNR_BASE}/2/query",   # Major Roads and Forest Roads
         ],
     ),
 ]
