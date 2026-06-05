@@ -255,10 +255,11 @@ def _extract_road_name(props: dict) -> Optional[str]:
 def _arcgis_query_nearest_road(
     url: str, lat: float, lon: float, transformer: Transformer,
     point_utm: Point, radius_m: int,
-) -> Optional[Tuple[float, Optional[str]]]:
+) -> Tuple[Optional[Tuple[float, Optional[str]]], str]:
     """
     Generic ArcGIS REST roads query — works for TIGER, USFS, USGS NTD.
-    Returns (distance_m, name) of the nearest segment in the bbox, or None.
+    Returns ((distance_m, name) or None, status_str).
+    Statuses: "ok", "empty", "http_<code>", "timeout", "exception".
     """
     dlat = radius_m / 111320.0
     dlon = radius_m / (111320.0 * max(math.cos(math.radians(lat)), 1e-3))
@@ -277,11 +278,18 @@ def _arcgis_query_nearest_road(
     }
     try:
         r = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=20)
-        if r.status_code != 200:
-            return None
+    except requests.exceptions.Timeout:
+        return None, "timeout"
+    except requests.exceptions.RequestException:
+        return None, "exception"
+    if r.status_code != 200:
+        return None, f"http_{r.status_code}"
+    try:
         data = r.json()
-    except Exception:
-        return None
+    except ValueError:
+        return None, "non_json"
+    if "error" in data:
+        return None, f"arcgis_error_{data.get('error', {}).get('code', '?')}"
 
     nearest_dist: Optional[float] = None
     nearest_name: Optional[str] = None
@@ -311,8 +319,8 @@ def _arcgis_query_nearest_road(
                 nearest_name = _extract_road_name(props)
 
     if nearest_dist is None:
-        return None
-    return nearest_dist, nearest_name
+        return None, "empty"
+    return (nearest_dist, nearest_name), "ok"
 
 
 # Captures per-source cascade results from the most recent call, for UI debugging.
@@ -339,19 +347,17 @@ def _cascade_nearest_road(
             continue
         for url in urls:
             layer = url.split("/MapServer/")[-1].split("/")[0]
-            result = _arcgis_query_nearest_road(
+            result, status = _arcgis_query_nearest_road(
                 url, lat, lon, transformer, point_utm, radius_m
             )
             if result is None:
                 LAST_ROAD_CASCADE_DEBUG.append({
-                    "source": label, "layer": layer,
-                    "status": "no_features_or_error",
+                    "source": label, "layer": layer, "status": status,
                 })
                 continue
             d, name = result
             LAST_ROAD_CASCADE_DEBUG.append({
-                "source": label, "layer": layer,
-                "status": "ok",
+                "source": label, "layer": layer, "status": status,
                 "nearest_m": round(d, 1),
                 "name": name,
             })
