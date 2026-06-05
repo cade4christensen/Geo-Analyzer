@@ -109,13 +109,19 @@ def process_excel(input_path: str, round_to: str = "hundredth") -> str:
         print("Error: openpyxl not installed. Run: pip3 install openpyxl", file=sys.stderr)
         sys.exit(1)
 
-    wb = openpyxl.load_workbook(input_path)
+    # data_only=True reads cached formula results (e.g. =LEFT(B,FIND(",",B)-1)*1)
+    # instead of the formula text itself.
+    wb = openpyxl.load_workbook(input_path, data_only=True)
     ws = wb.active
 
     # --- Detect lat/lon columns ---
     headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
     lat_col = _find_column(headers, "lat", "latitude")
     lon_col = _find_column(headers, "lon", "long", "longitude")
+    # Optional fallback column with raw "lat,lon" text — used when lat/lon
+    # cells are uncached formulas.
+    coord_col = _find_column(headers, "coordinates", "coord", "coords",
+                             "latlon", "lat,lon", "find.coord", "find coord")
 
     if lat_col is None or lon_col is None:
         print(
@@ -163,15 +169,32 @@ def process_excel(input_path: str, round_to: str = "hundredth") -> str:
         lat_val = row[lat_col].value
         lon_val = row[lon_col].value
 
-        if lat_val is None or lon_val is None:
-            print(f"  Row {row_idx + 1}: skipped (empty lat/lon)")
-            _write_result_row(ws, row_idx + 1, summary_start, detail_start, tail_start, None)
-            continue
-
+        # Try the lat/lon columns first.
+        lat_f = lon_f = None
         try:
-            lat_f = float(lat_val)
-            lon_f = float(lon_val)
+            if lat_val is not None and lon_val is not None:
+                lat_f, lon_f = float(lat_val), float(lon_val)
         except (TypeError, ValueError):
+            lat_f = lon_f = None
+
+        # Fallback: parse "lat,lon" from the Coordinates column if the lat/lon
+        # cells were uncached formulas or otherwise unreadable.
+        if (lat_f is None or lon_f is None) and coord_col is not None:
+            raw = row[coord_col].value
+            if raw is not None:
+                text = str(raw).replace("−", "-").strip()
+                for sep in (",", " ", "\t"):
+                    parts = text.split(sep, 1)
+                    if len(parts) == 2:
+                        try:
+                            a, b = float(parts[0].strip()), float(parts[1].strip())
+                            if -90 <= a <= 90 and -180 <= b <= 180:
+                                lat_f, lon_f = a, b
+                                break
+                        except ValueError:
+                            continue
+
+        if lat_f is None or lon_f is None:
             print(f"  Row {row_idx + 1}: skipped (invalid lat/lon: {lat_val}, {lon_val})")
             _write_result_row(ws, row_idx + 1, summary_start, detail_start, tail_start, None)
             continue

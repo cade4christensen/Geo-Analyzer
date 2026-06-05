@@ -11,11 +11,28 @@ US-focused (NLCD raster is L48 only) but OSM-derived signals work anywhere.
 
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Tuple, Dict
 
 import requests
 from shapely.geometry import Point, LineString, Polygon
 from pyproj import Transformer
+
+
+def _parallel(fn, args_list, max_workers: int = 8) -> list:
+    """
+    Call fn(*args) for each args tuple concurrently and return results in order.
+    Exceptions from individual calls become None — caller is expected to treat
+    None as "this lookup failed" the same way it would for any other failure.
+    """
+    def _safe(args):
+        try:
+            return fn(*args)
+        except Exception:
+            return None
+    workers = min(max_workers, max(1, len(args_list)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(_safe, args_list))
 
 # ---------------------------------------------------------------------------
 # Endpoints & headers
@@ -356,11 +373,21 @@ def _cascade_nearest_road(
                 "reason": f"running best {best[0]:.0f}m <= threshold {threshold}m",
             })
             continue
-        for url in urls:
+        # All URLs within a tier are independent gov endpoints — fire them
+        # concurrently so the tier takes the time of its slowest call, not
+        # the sum.
+        call_args = [(url, lat, lon, transformer, point_utm, radius_m)
+                     for url in urls]
+        outcomes = _parallel(_arcgis_query_nearest_road, call_args)
+
+        for url, outcome in zip(urls, outcomes):
             layer = url.split("/MapServer/")[-1].split("/")[0]
-            result, status = _arcgis_query_nearest_road(
-                url, lat, lon, transformer, point_utm, radius_m
-            )
+            if outcome is None:
+                LAST_ROAD_CASCADE_DEBUG.append({
+                    "source": label, "layer": layer, "status": "exception",
+                })
+                continue
+            result, status = outcome
             if result is None:
                 LAST_ROAD_CASCADE_DEBUG.append({
                     "source": label, "layer": layer, "status": status,
@@ -732,15 +759,19 @@ def _nlcd_hint_with_offset_fallback(lat: float, lon: float) -> Optional[str]:
     if hint or nlcd_val not in (None, 11, 12, 90, 95):
         return hint
 
-    # Centre is water/wetland with no developed hint — look around 400m out.
+    # Centre is water/wetland with no developed hint — look 400m out in
+    # 4 cardinal directions, all in parallel.
     offset_m = 400
     dlat = offset_m / 111320.0
     dlon = offset_m / (111320.0 * max(math.cos(math.radians(lat)), 1e-3))
+    offsets = [
+        (lat + dlat, lon), (lat - dlat, lon),
+        (lat, lon + dlon), (lat, lon - dlon),
+    ]
+    values = _parallel(_get_nlcd_value, offsets)
 
     counts: Dict[int, int] = {}
-    for olat, olon in [(lat + dlat, lon), (lat - dlat, lon),
-                       (lat, lon + dlon), (lat, lon - dlon)]:
-        v = _get_nlcd_value(olat, olon)
+    for v in values:
         if v is not None and v != 11:  # skip more water samples
             counts[v] = counts.get(v, 0) + 1
 
@@ -766,7 +797,6 @@ def classify_population(lat: float, lon: float) -> str:
         return "Urban"
 
     # Primary signal: 500m radius around the point.
-    time.sleep(1)  # gentle rate-limit
     b500_score, b500_count, r500 = _count_buildings_and_roads(lat, lon, 500)
     LAST_POP_DEBUG["b500_score"] = b500_score
     LAST_POP_DEBUG["b500_count"] = b500_count
@@ -789,7 +819,6 @@ def classify_population(lat: float, lon: float) -> str:
 
     # Wider 1000m context — same OSM-based fallback as before.
     if result in ("Rural", "Wilderness"):
-        time.sleep(1)
         b1000_score, b1000_count, r1000 = _count_buildings_and_roads(lat, lon, 1000)
         LAST_POP_DEBUG["b1000_score"] = b1000_score
         LAST_POP_DEBUG["b1000_count"] = b1000_count

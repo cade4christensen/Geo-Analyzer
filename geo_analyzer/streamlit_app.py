@@ -159,7 +159,9 @@ def process_excel_bytes(file_bytes: bytes, decimals: int) -> bytes:
         DETAIL_COLUMNS.append(f"Nearest {fk} Name")
     TAIL_COLUMNS = ["Surface", "Population"]
 
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    # data_only=True returns cached numeric values for formula cells (e.g.
+    # =LEFT(B2,FIND(",",B2)-1)*1) instead of the raw formula text.
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     ws = wb.active
 
     headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
@@ -173,6 +175,10 @@ def process_excel_bytes(file_bytes: bytes, decimals: int) -> bytes:
 
     lat_col = find_col("lat", "latitude")
     lon_col = find_col("lon", "long", "longitude")
+    # Optional fallback column with raw "lat,lon" text used when the lat/lon
+    # cells are uncached formulas.
+    coord_col = find_col("coordinates", "coord", "coords", "latlon", "lat,lon",
+                         "find.coord", "find coord")
 
     if lat_col is None or lon_col is None:
         st.error("Could not find lat/lon columns.")
@@ -209,11 +215,23 @@ def process_excel_bytes(file_bytes: bytes, decimals: int) -> bytes:
             for i in range(len(SUMMARY_COLUMNS) + len(DETAIL_COLUMNS) + len(TAIL_COLUMNS)):
                 ws.cell(row=row_idx + 1, column=summary_start + i, value="ERROR")
 
-        if lat_val is None or lon_val is None:
-            write_error(); continue
+        # Try the dedicated lat/lon columns first.
+        lat_f = lon_f = None
         try:
-            lat_f, lon_f = float(lat_val), float(lon_val)
+            if lat_val is not None and lon_val is not None:
+                lat_f, lon_f = float(lat_val), float(lon_val)
         except (TypeError, ValueError):
+            lat_f = lon_f = None  # likely a formula string; fall through to coords
+
+        # Fallback: parse "lat,lon" from the Coordinates column if the lat/lon
+        # cells were formulas without cached values.
+        if (lat_f is None or lon_f is None) and coord_col is not None:
+            raw = row[coord_col].value
+            parsed = _try_parse_pair(str(raw)) if raw is not None else None
+            if parsed is not None:
+                lat_f, lon_f = parsed
+
+        if lat_f is None or lon_f is None:
             write_error(); continue
 
         try:
