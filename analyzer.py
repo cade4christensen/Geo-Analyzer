@@ -218,14 +218,16 @@ def _to_utm(transformer: Transformer, lon: float, lat: float) -> Tuple[float, fl
 _OVERPASS_SEMAPHORE = threading.Semaphore(3)
 
 
-def _query_overpass(ql: str, retries: int = 3) -> dict:
+def _query_overpass(ql: str, retries: int = 2) -> dict:
+    # Tight timeout: Overpass usually responds in <5s; if it hasn't replied
+    # in 20s it's overloaded and we'd rather fall back to the next mirror.
     last_err = "no attempts made"
     for attempt in range(retries):
         url = OVERPASS_ENDPOINTS[attempt % len(OVERPASS_ENDPOINTS)]
         try:
             with _OVERPASS_SEMAPHORE:
                 r = requests.post(url, data={"data": ql},
-                                  headers=HTTP_HEADERS, timeout=60)
+                                  headers=HTTP_HEADERS, timeout=20)
         except requests.exceptions.RequestException as e:
             last_err = f"network error on {url}: {e}"
         else:
@@ -315,7 +317,7 @@ def _arcgis_query_nearest_road(
         "f":              "geojson",
     }
     try:
-        r = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=20)
+        r = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=10)
     except requests.exceptions.Timeout:
         return None, "timeout"
     except requests.exceptions.RequestException:
@@ -646,7 +648,7 @@ def _get_nlcd_value(lat: float, lon: float) -> Optional[int]:
             NLCD_WCS_URL,
             params=params,
             headers={"User-Agent": HTTP_HEADERS["User-Agent"]},
-            timeout=30,
+            timeout=10,
         )
         r.raise_for_status()
 
@@ -892,6 +894,7 @@ def analyze(lat: float, lon: float, include_debug: bool = True) -> dict:
         print(f"Analyzing ({lat}, {lon})...")
 
     # Phase B: run the three top-level phases concurrently.
+    t0 = time.perf_counter()
     try:
         with ThreadPoolExecutor(max_workers=3) as ex:
             lin_fut = ex.submit(_run_with_debug_flag,
@@ -906,6 +909,11 @@ def analyze(lat: float, lon: float, include_debug: bool = True) -> dict:
             population = pop_fut.result()
     finally:
         _thread_state.debug_enabled = True
+
+    # Per-row timing in stdout (visible in Streamlit Cloud logs). Helps
+    # diagnose which calls are slow on a given run.
+    elapsed = time.perf_counter() - t0
+    print(f"  [timing] ({lat:.4f},{lon:.4f}) took {elapsed:.1f}s", flush=True)
 
     _zero_distances_by_threshold(linear)
 
