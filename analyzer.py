@@ -220,13 +220,20 @@ def _to_utm(transformer: Transformer, lon: float, lat: float) -> Tuple[float, fl
 # Overpass client
 # ---------------------------------------------------------------------------
 
+# Cap concurrent Overpass calls — three mirrors, three slots. Prevents the
+# row-level batch parallelism from hammering any single mirror and triggering
+# rate limits / 429s.
+_OVERPASS_SEMAPHORE = threading.Semaphore(3)
+
+
 def _query_overpass(ql: str, retries: int = 3) -> dict:
     last_err = "no attempts made"
     for attempt in range(retries):
         url = OVERPASS_ENDPOINTS[attempt % len(OVERPASS_ENDPOINTS)]
         try:
-            r = requests.post(url, data={"data": ql},
-                              headers=HTTP_HEADERS, timeout=60)
+            with _OVERPASS_SEMAPHORE:
+                r = requests.post(url, data={"data": ql},
+                                  headers=HTTP_HEADERS, timeout=60)
         except requests.exceptions.RequestException as e:
             last_err = f"network error on {url}: {e}"
         else:

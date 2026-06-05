@@ -250,10 +250,15 @@ def process_excel_bytes(file_bytes: bytes, decimals: int, max_workers: int = 4) 
             return r_idx, None
 
     completed = 0
+    PER_ROW_TIMEOUT_S = 180  # any single row that takes > 3 minutes is treated as failed
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         future_to_row = {executor.submit(_run, j): j[0] for j in jobs}
         for future in as_completed(future_to_row):
-            r_idx, result = future.result()
+            r_idx = future_to_row[future]
+            try:
+                r_idx, result = future.result(timeout=PER_ROW_TIMEOUT_S)
+            except Exception:
+                result = None
             completed += 1
             progress.progress(completed / max(1, total),
                               text=f"Analyzed {completed} of {total} rows...")
@@ -481,9 +486,9 @@ with tab_excel:
 
     workers = st.slider(
         "Parallel workers",
-        min_value=1, max_value=8, value=4,
+        min_value=1, max_value=6, value=3,
         help="How many rows to analyze in parallel. Higher = faster, but more "
-             "risk of hitting upstream rate limits. 4 is a good default.",
+             "risk of upstream rate limits (especially Overpass). 3 is a safe default.",
     )
 
     if uploaded is not None:
