@@ -315,6 +315,10 @@ def _arcgis_query_nearest_road(
     return nearest_dist, nearest_name
 
 
+# Captures per-source cascade results from the most recent call, for UI debugging.
+LAST_ROAD_CASCADE_DEBUG: List[dict] = []
+
+
 def _cascade_nearest_road(
     lat: float, lon: float, transformer: Transformer, point_utm: Point,
     radius_m: int, starting_best: Optional[Tuple[float, Optional[str], str]] = None,
@@ -323,18 +327,34 @@ def _cascade_nearest_road(
     Walk TIGER → USFS → USGS NTD. Stops as soon as the running winner is
     already within the next dataset's threshold. Returns (dist, name, source).
     """
+    LAST_ROAD_CASCADE_DEBUG.clear()
     best = starting_best  # (dist, name, source) or None
 
     for label, threshold, urls in _ROAD_DATASETS:
         if best is not None and best[0] <= threshold:
-            break
+            LAST_ROAD_CASCADE_DEBUG.append({
+                "source": label, "status": "skipped",
+                "reason": f"running best {best[0]:.0f}m <= threshold {threshold}m",
+            })
+            continue
         for url in urls:
+            layer = url.split("/MapServer/")[-1].split("/")[0]
             result = _arcgis_query_nearest_road(
                 url, lat, lon, transformer, point_utm, radius_m
             )
             if result is None:
+                LAST_ROAD_CASCADE_DEBUG.append({
+                    "source": label, "layer": layer,
+                    "status": "no_features_or_error",
+                })
                 continue
             d, name = result
+            LAST_ROAD_CASCADE_DEBUG.append({
+                "source": label, "layer": layer,
+                "status": "ok",
+                "nearest_m": round(d, 1),
+                "name": name,
+            })
             if best is None or d < best[0]:
                 best = (d, name, label)
 
@@ -815,6 +835,7 @@ def analyze(lat: float, lon: float) -> dict:
         "linear_features": linear,
         "surface":         surface,
         "_pop_debug":      dict(LAST_POP_DEBUG),
+        "_road_cascade":   list(LAST_ROAD_CASCADE_DEBUG),
         "population":      population,
     }
 

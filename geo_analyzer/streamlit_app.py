@@ -137,6 +137,12 @@ def display_results(result: dict, decimals: int):
         with st.expander("Population signal debug"):
             st.json(pop_debug)
 
+    # Per-source cascade results for the Road category (TIGER/USFS/USGS)
+    road_cascade = result.get("_road_cascade") or []
+    if road_cascade:
+        with st.expander("Road cascade debug"):
+            st.json(road_cascade)
+
 
 # ---------------------------------------------------------------------------
 # Excel processing
