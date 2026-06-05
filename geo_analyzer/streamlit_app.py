@@ -148,10 +148,9 @@ def display_results(result: dict, decimals: int):
 # Excel processing
 # ---------------------------------------------------------------------------
 
-def process_excel_bytes(file_bytes: bytes, decimals: int, max_workers: int = 4) -> bytes:
+def process_excel_bytes(file_bytes: bytes, decimals: int) -> bytes:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     SUMMARY_COLUMNS = ["Nearest Feature (m)", "Nearest Feature Type"]
     DETAIL_COLUMNS = []
@@ -207,15 +206,17 @@ def process_excel_bytes(file_bytes: bytes, decimals: int, max_workers: int = 4) 
     total = ws.max_row - 1
     progress = st.progress(0, text="Analyzing rows...")
 
-    # First pass: pull coords out of each row and decide which to process vs. skip.
-    jobs: list = []  # list of (row_idx, lat_f, lon_f) for valid rows
-    skipped_rows: list = []  # row indexes that should write ERROR
-
     def write_error(r_idx):
         for i in range(len(SUMMARY_COLUMNS) + len(DETAIL_COLUMNS) + len(TAIL_COLUMNS)):
             ws.cell(row=r_idx + 1, column=summary_start + i, value="ERROR")
 
+    # Sequential row processing with within-row Phase A parallelism (NLCD
+    # offsets and road cascade tier URLs already fire concurrently inside
+    # analyze()). Row-by-row sequencing keeps the progress bar updating
+    # reliably and avoids stacking concurrent HTTP load on upstream services.
     for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=1):
+        progress.progress(row_idx / max(1, total),
+                          text=f"Analyzing row {row_idx} of {total}...")
         lat_val = row[lat_col].value
         lon_val = row[lon_col].value
 
@@ -233,63 +234,36 @@ def process_excel_bytes(file_bytes: bytes, decimals: int, max_workers: int = 4) 
                 lat_f, lon_f = parsed
 
         if lat_f is None or lon_f is None:
-            skipped_rows.append(row_idx)
-        else:
-            jobs.append((row_idx, lat_f, lon_f))
+            write_error(row_idx); continue
 
-    for r_idx in skipped_rows:
-        write_error(r_idx)
-
-    # Run analyses concurrently. Each row is independent — include_debug=False
-    # keeps the module-level debug dicts thread-safe.
-    def _run(job):
-        r_idx, la, lo = job
         try:
-            return r_idx, analyze(la, lo, include_debug=False)
+            result = analyze(lat_f, lon_f, include_debug=False)
         except Exception:
-            return r_idx, None
+            write_error(row_idx); continue
 
-    completed = 0
-    PER_ROW_TIMEOUT_S = 180  # any single row that takes > 3 minutes is treated as failed
-    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-        future_to_row = {executor.submit(_run, j): j[0] for j in jobs}
-        for future in as_completed(future_to_row):
-            r_idx = future_to_row[future]
-            try:
-                r_idx, result = future.result(timeout=PER_ROW_TIMEOUT_S)
-            except Exception:
-                result = None
-            completed += 1
-            progress.progress(completed / max(1, total),
-                              text=f"Analyzed {completed} of {total} rows...")
+        lf = result["linear_features"]
+        nearest_dist = None
+        nearest_type = None
+        for key in FEATURE_KEYS:
+            d = lf.get(key, {}).get("distance_m")
+            if d is not None and (nearest_dist is None or d < nearest_dist):
+                nearest_dist = d; nearest_type = key
 
-            if result is None:
-                write_error(r_idx)
-                continue
+        nd = _round_dist(nearest_dist, decimals) if nearest_dist is not None else "none within 2km"
+        ws.cell(row=row_idx + 1, column=summary_start,     value=nd)
+        ws.cell(row=row_idx + 1, column=summary_start + 1, value=nearest_type or "none within 2km")
 
-            lf = result["linear_features"]
-            nearest_dist = None
-            nearest_type = None
-            for key in FEATURE_KEYS:
-                d = lf.get(key, {}).get("distance_m")
-                if d is not None and (nearest_dist is None or d < nearest_dist):
-                    nearest_dist = d; nearest_type = key
+        col = detail_start
+        for key in FEATURE_KEYS:
+            info = lf.get(key, {})
+            dist = info.get("distance_m")
+            name = info.get("name")
+            ws.cell(row=row_idx + 1, column=col,     value=_round_dist(dist, decimals) if dist is not None else "none within 2km")
+            ws.cell(row=row_idx + 1, column=col + 1, value=name or "")
+            col += 2
 
-            nd = _round_dist(nearest_dist, decimals) if nearest_dist is not None else "none within 2km"
-            ws.cell(row=r_idx + 1, column=summary_start,     value=nd)
-            ws.cell(row=r_idx + 1, column=summary_start + 1, value=nearest_type or "none within 2km")
-
-            col = detail_start
-            for key in FEATURE_KEYS:
-                info = lf.get(key, {})
-                dist = info.get("distance_m")
-                name = info.get("name")
-                ws.cell(row=r_idx + 1, column=col,     value=_round_dist(dist, decimals) if dist is not None else "none within 2km")
-                ws.cell(row=r_idx + 1, column=col + 1, value=name or "")
-                col += 2
-
-            ws.cell(row=r_idx + 1, column=tail_start,     value=result["surface"])
-            ws.cell(row=r_idx + 1, column=tail_start + 1, value=result["population"])
+        ws.cell(row=row_idx + 1, column=tail_start,     value=result["surface"])
+        ws.cell(row=row_idx + 1, column=tail_start + 1, value=result["population"])
 
     all_cols = SUMMARY_COLUMNS + DETAIL_COLUMNS + TAIL_COLUMNS
     for i, name in enumerate(all_cols):
@@ -484,17 +458,10 @@ with tab_excel:
     )
     uploaded = st.file_uploader("Choose an Excel file", type=["xlsx"])
 
-    workers = st.slider(
-        "Parallel workers",
-        min_value=1, max_value=6, value=3,
-        help="How many rows to analyze in parallel. Higher = faster, but more "
-             "risk of upstream rate limits (especially Overpass). 3 is a safe default.",
-    )
-
     if uploaded is not None:
         if st.button("Run Analysis", type="primary", use_container_width=True):
             file_bytes = uploaded.read()
-            result_bytes = process_excel_bytes(file_bytes, decimals, max_workers=workers)
+            result_bytes = process_excel_bytes(file_bytes, decimals)
             if result_bytes:
                 st.success("Done!")
                 st.download_button(
