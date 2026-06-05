@@ -10,9 +10,20 @@ US-focused (NLCD raster is L48 only) but OSM-derived signals work anywhere.
 """
 
 import math
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Tuple, Dict
+
+# Thread-local flag — when False, debug-dict writes are skipped. Set by
+# analyze() based on its include_debug param; lets concurrent batch workers
+# safely share the module-level LAST_* dicts without races (they just don't
+# touch them).
+_thread_state = threading.local()
+
+
+def _debug_enabled() -> bool:
+    return getattr(_thread_state, "debug_enabled", True)
 
 import requests
 from shapely.geometry import Point, LineString, Polygon
@@ -363,15 +374,18 @@ def _cascade_nearest_road(
     Walk TIGER → USFS → USGS NTD. Stops as soon as the running winner is
     already within the next dataset's threshold. Returns (dist, name, source).
     """
-    LAST_ROAD_CASCADE_DEBUG.clear()
+    debug_on = _debug_enabled()
+    if debug_on:
+        LAST_ROAD_CASCADE_DEBUG.clear()
     best = starting_best  # (dist, name, source) or None
 
     for label, threshold, urls in _ROAD_DATASETS:
         if best is not None and best[0] <= threshold:
-            LAST_ROAD_CASCADE_DEBUG.append({
-                "source": label, "status": "skipped",
-                "reason": f"running best {best[0]:.0f}m <= threshold {threshold}m",
-            })
+            if debug_on:
+                LAST_ROAD_CASCADE_DEBUG.append({
+                    "source": label, "status": "skipped",
+                    "reason": f"running best {best[0]:.0f}m <= threshold {threshold}m",
+                })
             continue
         # All URLs within a tier are independent gov endpoints — fire them
         # concurrently so the tier takes the time of its slowest call, not
@@ -383,22 +397,25 @@ def _cascade_nearest_road(
         for url, outcome in zip(urls, outcomes):
             layer = url.split("/MapServer/")[-1].split("/")[0]
             if outcome is None:
-                LAST_ROAD_CASCADE_DEBUG.append({
-                    "source": label, "layer": layer, "status": "exception",
-                })
+                if debug_on:
+                    LAST_ROAD_CASCADE_DEBUG.append({
+                        "source": label, "layer": layer, "status": "exception",
+                    })
                 continue
             result, status = outcome
             if result is None:
-                LAST_ROAD_CASCADE_DEBUG.append({
-                    "source": label, "layer": layer, "status": status,
-                })
+                if debug_on:
+                    LAST_ROAD_CASCADE_DEBUG.append({
+                        "source": label, "layer": layer, "status": status,
+                    })
                 continue
             d, name = result
-            LAST_ROAD_CASCADE_DEBUG.append({
-                "source": label, "layer": layer, "status": status,
-                "nearest_m": round(d, 1),
-                "name": name,
-            })
+            if debug_on:
+                LAST_ROAD_CASCADE_DEBUG.append({
+                    "source": label, "layer": layer, "status": status,
+                    "nearest_m": round(d, 1),
+                    "name": name,
+                })
             if best is None or d < best[0]:
                 best = (d, name, label)
 
@@ -781,109 +798,106 @@ def _nlcd_hint_with_offset_fallback(lat: float, lon: float) -> Optional[str]:
     return NLCD_POP_HINT.get(dominant)
 
 
+# Single-threaded debug dict; only safe with `include_debug=True` in non-
+# concurrent contexts (interactive single-coord runs). Batch / parallel
+# callers should pass include_debug=False to skip writes.
 LAST_POP_DEBUG: Dict[str, object] = {}
 
 
-def classify_population(lat: float, lon: float) -> str:
+def classify_population(lat: float, lon: float, include_debug: bool = True) -> str:
     """Returns Wilderness | Rural | Suburban | Urban."""
-    LAST_POP_DEBUG.clear()
+    if include_debug:
+        LAST_POP_DEBUG.clear()
+
+    def _dbg(k, v):
+        if include_debug:
+            LAST_POP_DEBUG[k] = v
 
     nlcd_hint = _nlcd_hint_with_offset_fallback(lat, lon)
-    LAST_POP_DEBUG["nlcd_hint"] = nlcd_hint
+    _dbg("nlcd_hint", nlcd_hint)
 
     # Trust NLCD at the top end — NLCD 24 is reliable for high-density urban.
     if nlcd_hint == "Urban":
-        LAST_POP_DEBUG["path"] = "nlcd_hint=Urban shortcut"
+        _dbg("path", "nlcd_hint=Urban shortcut")
         return "Urban"
 
     # Primary signal: 500m radius around the point.
     b500_score, b500_count, r500 = _count_buildings_and_roads(lat, lon, 500)
-    LAST_POP_DEBUG["b500_score"] = b500_score
-    LAST_POP_DEBUG["b500_count"] = b500_count
-    LAST_POP_DEBUG["r500"] = r500
+    _dbg("b500_score", b500_score)
+    _dbg("b500_count", b500_count)
+    _dbg("r500", r500)
     if b500_score is None:
-        LAST_POP_DEBUG["path"] = "500m query failed"
+        _dbg("path", "500m query failed")
         return nlcd_hint or "Wilderness"
 
-    # Strong NLCD trust: if offset-sampled NLCD says Suburban, the surrounding
-    # land cover is suburban. Only require minimal OSM evidence.
     if nlcd_hint == "Suburban" and (b500_score >= 0.4 or r500 > 500):
         if b500_count >= 250 or b500_score >= 70:
-            LAST_POP_DEBUG["path"] = "NLCD-Suburban + high OSM → Urban"
+            _dbg("path", "NLCD-Suburban + high OSM → Urban")
             return "Urban"
-        LAST_POP_DEBUG["path"] = "NLCD-Suburban + any OSM → Suburban"
+        _dbg("path", "NLCD-Suburban + any OSM → Suburban")
         return "Suburban"
 
     result = _classify_from_signals(b500_score, r500, nlcd_hint, b500_count)
-    LAST_POP_DEBUG["primary_result"] = result
+    _dbg("primary_result", result)
 
-    # Wider 1000m context — same OSM-based fallback as before.
     if result in ("Rural", "Wilderness"):
         b1000_score, b1000_count, r1000 = _count_buildings_and_roads(lat, lon, 1000)
-        LAST_POP_DEBUG["b1000_score"] = b1000_score
-        LAST_POP_DEBUG["b1000_count"] = b1000_count
-        LAST_POP_DEBUG["r1000"] = r1000
+        _dbg("b1000_score", b1000_score)
+        _dbg("b1000_count", b1000_count)
+        _dbg("r1000", r1000)
         if b1000_count is not None:
             if b1000_count >= 30 and r1000 > 3500:
-                LAST_POP_DEBUG["path"] = "wider: 30+ buildings + 3500m road → Suburban"
+                _dbg("path", "wider: 30+ buildings + 3500m road → Suburban")
                 return "Suburban"
             if b1000_count >= 60:
-                LAST_POP_DEBUG["path"] = "wider: 60+ buildings → Suburban"
+                _dbg("path", "wider: 60+ buildings → Suburban")
                 return "Suburban"
             if nlcd_hint in ("Suburban", "Urban") and (
                 b1000_count >= 5 or (r1000 or 0) > 2000
             ):
-                LAST_POP_DEBUG["path"] = "wider: NLCD-developed + any OSM → Suburban"
+                _dbg("path", "wider: NLCD-developed + any OSM → Suburban")
                 return "Suburban"
             if result == "Wilderness" and b1000_count >= 3:
-                LAST_POP_DEBUG["path"] = "wider: Wilderness + 3+ buildings → Rural"
+                _dbg("path", "wider: Wilderness + 3+ buildings → Rural")
                 return "Rural"
 
-    LAST_POP_DEBUG["path"] = f"final fallthrough → {result}"
+    _dbg("path", f"final fallthrough → {result}")
     return result
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def analyze(lat: float, lon: float) -> dict:
+def analyze(lat: float, lon: float, include_debug: bool = True) -> dict:
     """
-    Full analysis for a coordinate. Returns:
-    {
-      "coordinate": {"lat": float, "lon": float},
-      "linear_features": {
-          "Road":          {"distance_m": float|None, "name": str|None},
-          "Trail":         ...,
-          "Railroad":      ...,
-          "Utility Line":  ...,
-          "Water Feature": ...,
-      },
-      "surface":    str,   # what the point landed on
-      "population": str,   # Wilderness/Rural/Suburban/Urban
-    }
+    Full analysis for a coordinate. `include_debug` controls whether the
+    debug dicts (LAST_POP_DEBUG / LAST_ROAD_CASCADE_DEBUG) are populated and
+    embedded in the result. Set to False for batch / concurrent use to keep
+    the module-level dicts thread-safe.
     """
     _validate_coord(lat, lon)
-    print(f"Analyzing ({lat}, {lon})...")
+    _thread_state.debug_enabled = include_debug
+    try:
+        if include_debug:
+            print(f"Analyzing ({lat}, {lon})...")
 
-    print("  Querying linear features...")
-    linear = find_nearest_linear_features(lat, lon)
+        linear = find_nearest_linear_features(lat, lon)
+        surface = get_surface_at_point(lat, lon)
+        _zero_distances_by_threshold(linear)
+        population = classify_population(lat, lon, include_debug=include_debug)
 
-    print("  Identifying surface at point...")
-    surface = get_surface_at_point(lat, lon)
-
-    _zero_distances_by_threshold(linear)
-
-    print("  Classifying population...")
-    population = classify_population(lat, lon)
-
-    return {
-        "coordinate":      {"lat": lat, "lon": lon},
-        "linear_features": linear,
-        "surface":         surface,
-        "_pop_debug":      dict(LAST_POP_DEBUG),
-        "_road_cascade":   list(LAST_ROAD_CASCADE_DEBUG),
-        "population":      population,
-    }
+        out = {
+            "coordinate":      {"lat": lat, "lon": lon},
+            "linear_features": linear,
+            "surface":         surface,
+            "population":      population,
+        }
+        if include_debug:
+            out["_pop_debug"]    = dict(LAST_POP_DEBUG)
+            out["_road_cascade"] = list(LAST_ROAD_CASCADE_DEBUG)
+        return out
+    finally:
+        _thread_state.debug_enabled = True
 
 
 def _zero_distances_by_threshold(linear: dict) -> None:
