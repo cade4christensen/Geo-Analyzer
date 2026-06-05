@@ -61,12 +61,12 @@ NLCD_WCS_URL = "https://www.mrlc.gov/geoserver/mrlc_display/NLCD_2021_Land_Cover
 
 # Cascade of free authoritative US road datasets — tried in order when OSM is
 # sparse. Each is queried via ArcGIS REST; the closer-than-threshold result wins.
+# USGS NTD was dropped — its source data is derived from TIGER + USFS, so it
+# duplicates what we already query and only added latency (4 HTTP calls).
 _TIGER_BASE = ("https://tigerweb.geo.census.gov/arcgis/rest/services/"
                "TIGERweb/Transportation/MapServer")
 _USFS_BASE  = ("https://apps.fs.usda.gov/arcx/rest/services/EDW/"
                "EDW_RoadBasic_01/MapServer")
-_USGS_BASE  = ("https://carto.nationalmap.gov/arcgis/rest/services/"
-               "transportation/MapServer")
 _WADNR_BASE = ("https://gis.dnr.wa.gov/site3/rest/services/"
                "Public_Transportation/WADNR_PUBLIC_ENG_Roads/MapServer")
 
@@ -85,18 +85,10 @@ _ROAD_DATASETS = [
         ],
     ),
     (
-        "USGS", 200, [
-            f"{_USGS_BASE}/32/query",   # Local Roads
-            f"{_USGS_BASE}/35/query",   # 4WD Roads — logging / forest spurs
-            f"{_USGS_BASE}/31/query",   # Local Connecting Roads
-            f"{_USGS_BASE}/30/query",   # Secondary Highways
-        ],
-    ),
-    (
         # WA-only state forest land roads (active DNR-managed roads,
         # including forest spurs not in federal datasets). Silently no-ops
         # outside Washington.
-        "WA_DNR", 150, [
+        "WA_DNR", 200, [
             f"{_WADNR_BASE}/5/query",   # Active Roads (full detail)
             f"{_WADNR_BASE}/2/query",   # Major Roads and Forest Roads
         ],
@@ -875,36 +867,58 @@ def classify_population(lat: float, lon: float, include_debug: bool = True) -> s
 # Public API
 # ---------------------------------------------------------------------------
 
+def _run_with_debug_flag(fn, flag_val, *args, **kwargs):
+    """Set the thread-local debug flag, then invoke fn — used so worker
+    threads spawned inside analyze() respect the include_debug setting."""
+    _thread_state.debug_enabled = flag_val
+    return fn(*args, **kwargs)
+
+
 def analyze(lat: float, lon: float, include_debug: bool = True) -> dict:
     """
-    Full analysis for a coordinate. `include_debug` controls whether the
-    debug dicts (LAST_POP_DEBUG / LAST_ROAD_CASCADE_DEBUG) are populated and
-    embedded in the result. Set to False for batch / concurrent use to keep
-    the module-level dicts thread-safe.
+    Full analysis for a coordinate. The three top-level phases (linear
+    features, surface, population) are independent and run concurrently —
+    drops per-coord wall time from sum-of-phases to max-of-phases.
+
+    `include_debug` controls whether LAST_POP_DEBUG / LAST_ROAD_CASCADE_DEBUG
+    are written to and embedded in the result. Set to False for batch use
+    (Streamlit's `process_excel_bytes` does this) to keep module-level dicts
+    thread-safe and skip wasted dict-snapshot work.
     """
     _validate_coord(lat, lon)
     _thread_state.debug_enabled = include_debug
+
+    if include_debug:
+        print(f"Analyzing ({lat}, {lon})...")
+
+    # Phase B: run the three top-level phases concurrently.
     try:
-        if include_debug:
-            print(f"Analyzing ({lat}, {lon})...")
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            lin_fut = ex.submit(_run_with_debug_flag,
+                                find_nearest_linear_features, include_debug, lat, lon)
+            surf_fut = ex.submit(_run_with_debug_flag,
+                                 get_surface_at_point, include_debug, lat, lon)
+            pop_fut = ex.submit(_run_with_debug_flag,
+                                classify_population, include_debug, lat, lon, include_debug)
 
-        linear = find_nearest_linear_features(lat, lon)
-        surface = get_surface_at_point(lat, lon)
-        _zero_distances_by_threshold(linear)
-        population = classify_population(lat, lon, include_debug=include_debug)
-
-        out = {
-            "coordinate":      {"lat": lat, "lon": lon},
-            "linear_features": linear,
-            "surface":         surface,
-            "population":      population,
-        }
-        if include_debug:
-            out["_pop_debug"]    = dict(LAST_POP_DEBUG)
-            out["_road_cascade"] = list(LAST_ROAD_CASCADE_DEBUG)
-        return out
+            linear     = lin_fut.result()
+            surface    = surf_fut.result()
+            population = pop_fut.result()
     finally:
         _thread_state.debug_enabled = True
+
+    _zero_distances_by_threshold(linear)
+
+    out = {
+        "coordinate":      {"lat": lat, "lon": lon},
+        "linear_features": linear,
+        "surface":         surface,
+        "population":      population,
+    }
+    if include_debug:
+        out["_pop_debug"]    = dict(LAST_POP_DEBUG)
+        out["_road_cascade"] = list(LAST_ROAD_CASCADE_DEBUG)
+    return out
 
 
 def _zero_distances_by_threshold(linear: dict) -> None:
