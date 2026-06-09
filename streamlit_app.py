@@ -148,9 +148,10 @@ def display_results(result: dict, decimals: int):
 # Excel processing
 # ---------------------------------------------------------------------------
 
-def process_excel_bytes(file_bytes: bytes, decimals: int) -> bytes:
+def process_excel_bytes(file_bytes: bytes, decimals: int, max_workers: int = 3) -> bytes:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     SUMMARY_COLUMNS = ["Nearest Feature (m)", "Nearest Feature Type"]
     DETAIL_COLUMNS = []

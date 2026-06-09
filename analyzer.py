@@ -10,9 +10,12 @@ US-focused (NLCD raster is L48 only) but OSM-derived signals work anywhere.
 """
 
 import math
+import os
+import pickle
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
 # Thread-local flag — when False, debug-dict writes are skipped. Set by
@@ -67,8 +70,13 @@ _TIGER_BASE = ("https://tigerweb.geo.census.gov/arcgis/rest/services/"
                "TIGERweb/Transportation/MapServer")
 _USFS_BASE  = ("https://apps.fs.usda.gov/arcx/rest/services/EDW/"
                "EDW_RoadBasic_01/MapServer")
+# WA DNR HTTP endpoint kept as fallback when the local pickle file is missing.
 _WADNR_BASE = ("https://gis.dnr.wa.gov/site3/rest/services/"
                "Public_Transportation/WADNR_PUBLIC_ENG_Roads/MapServer")
+_WADNR_HTTP_URLS = [
+    f"{_WADNR_BASE}/5/query",   # Active Roads (full detail)
+    f"{_WADNR_BASE}/2/query",   # Major Roads and Forest Roads
+]
 
 # Each dataset is (label, threshold_m, [list of query URLs to merge]).
 # The cascade stops once the running-best distance <= the next dataset's
@@ -82,15 +90,6 @@ _ROAD_DATASETS = [
     (
         "USFS", 300, [
             f"{_USFS_BASE}/0/query",    # National Forest System Roads
-        ],
-    ),
-    (
-        # WA-only state forest land roads (active DNR-managed roads,
-        # including forest spurs not in federal datasets). Silently no-ops
-        # outside Washington.
-        "WA_DNR", 200, [
-            f"{_WADNR_BASE}/5/query",   # Active Roads (full detail)
-            f"{_WADNR_BASE}/2/query",   # Major Roads and Forest Roads
         ],
     ),
 ]
@@ -363,6 +362,89 @@ def _arcgis_query_nearest_road(
     return (nearest_dist, nearest_name), "ok"
 
 
+# ---------------------------------------------------------------------------
+# Local WA DNR roads (loaded from a pickle file shipped in the repo). Replaces
+# the WA_DNR HTTP cascade tier with an in-memory STRtree lookup — single-digit
+# ms per query instead of 1-3 seconds round-trip to the state ArcGIS service.
+# Refresh by running `build_roads_db.py` on a laptop and committing the new
+# data/wa_dnr_roads.pkl file.
+# ---------------------------------------------------------------------------
+
+_LOCAL_WADNR_PATH = Path(__file__).parent / "data" / "wa_dnr_roads.pkl"
+_LOCAL_WADNR_LOCK = threading.Lock()
+_LOCAL_WADNR_LOADED = False
+_LOCAL_WADNR_GEOMS: List[LineString] = []
+_LOCAL_WADNR_META: List[dict] = []
+_LOCAL_WADNR_TREE = None  # shapely.strtree.STRtree
+
+
+def _ensure_local_wadnr_loaded() -> bool:
+    """Lazy-load the WA DNR pickle and build a spatial index. Returns True if
+    a non-empty dataset is available, False otherwise (so callers can fall back
+    to the HTTP cascade)."""
+    global _LOCAL_WADNR_LOADED, _LOCAL_WADNR_GEOMS, _LOCAL_WADNR_META, _LOCAL_WADNR_TREE
+    if _LOCAL_WADNR_LOADED:
+        return _LOCAL_WADNR_TREE is not None
+    with _LOCAL_WADNR_LOCK:
+        if _LOCAL_WADNR_LOADED:
+            return _LOCAL_WADNR_TREE is not None
+        try:
+            if not _LOCAL_WADNR_PATH.exists():
+                print(f"[local roads] no file at {_LOCAL_WADNR_PATH} — using HTTP cascade", flush=True)
+                _LOCAL_WADNR_LOADED = True
+                return False
+            t0 = time.perf_counter()
+            with open(_LOCAL_WADNR_PATH, "rb") as f:
+                roads = pickle.load(f)
+            _LOCAL_WADNR_GEOMS = [r[0] for r in roads]
+            _LOCAL_WADNR_META  = [r[1] for r in roads]
+            from shapely.strtree import STRtree
+            _LOCAL_WADNR_TREE = STRtree(_LOCAL_WADNR_GEOMS)
+            print(f"[local roads] loaded {len(_LOCAL_WADNR_GEOMS)} WA DNR roads "
+                  f"in {time.perf_counter() - t0:.2f}s", flush=True)
+        except Exception as e:
+            print(f"[local roads] failed to load: {e}", flush=True)
+            _LOCAL_WADNR_TREE = None
+        _LOCAL_WADNR_LOADED = True
+        return _LOCAL_WADNR_TREE is not None
+
+
+def _query_local_wadnr(
+    lat: float, lon: float, transformer: Transformer, point_utm: Point,
+    radius_m: int,
+) -> Tuple[Optional[Tuple[float, Optional[str]]], str]:
+    """Query the in-memory WA DNR STRtree. Same return signature as
+    `_arcgis_query_nearest_road`: ((distance_m, name) or None, status_str)."""
+    if not _ensure_local_wadnr_loaded():
+        return None, "no_local_data"
+
+    from shapely.geometry import box as _box
+    dlat = radius_m / 111320.0
+    dlon = radius_m / (111320.0 * max(math.cos(math.radians(lat)), 1e-3))
+    search_box = _box(lon - dlon, lat - dlat, lon + dlon, lat + dlat)
+
+    candidate_idxs = _LOCAL_WADNR_TREE.query(search_box)
+    if len(candidate_idxs) == 0:
+        return None, "empty"
+
+    nearest_dist: Optional[float] = None
+    nearest_name: Optional[str] = None
+    for idx in candidate_idxs:
+        ls_4326 = _LOCAL_WADNR_GEOMS[idx]
+        try:
+            ls_utm = LineString([_to_utm(transformer, x, y) for x, y in ls_4326.coords])
+        except Exception:
+            continue
+        d = point_utm.distance(ls_utm)
+        if nearest_dist is None or d < nearest_dist:
+            nearest_dist = d
+            nearest_name = _LOCAL_WADNR_META[idx].get("name")
+
+    if nearest_dist is None:
+        return None, "empty"
+    return (nearest_dist, nearest_name), "ok"
+
+
 # Captures per-source cascade results from the most recent call, for UI debugging.
 LAST_ROAD_CASCADE_DEBUG: List[dict] = []
 
@@ -419,6 +501,50 @@ def _cascade_nearest_road(
                 })
             if best is None or d < best[0]:
                 best = (d, name, label)
+
+    # WA DNR tier — local STRtree if available, HTTP fallback otherwise.
+    if best is None or best[0] > 200:
+        if _ensure_local_wadnr_loaded():
+            result, status = _query_local_wadnr(lat, lon, transformer, point_utm, radius_m)
+            if debug_on:
+                entry = {"source": "WA_DNR", "layer": "local", "status": status}
+                if result is not None:
+                    d, name = result
+                    entry["nearest_m"] = round(d, 1)
+                    entry["name"] = name
+                LAST_ROAD_CASCADE_DEBUG.append(entry)
+            if result is not None:
+                d, name = result
+                if best is None or d < best[0]:
+                    best = (d, name, "WA_DNR")
+        else:
+            # No local file — fall back to the original HTTP path.
+            wadnr_args = [(url, lat, lon, transformer, point_utm, radius_m)
+                          for url in _WADNR_HTTP_URLS]
+            outcomes = _parallel(_arcgis_query_nearest_road, wadnr_args)
+            for url, outcome in zip(_WADNR_HTTP_URLS, outcomes):
+                layer = url.split("/MapServer/")[-1].split("/")[0]
+                if outcome is None:
+                    if debug_on:
+                        LAST_ROAD_CASCADE_DEBUG.append({
+                            "source": "WA_DNR", "layer": layer, "status": "exception",
+                        })
+                    continue
+                result, status = outcome
+                if result is None:
+                    if debug_on:
+                        LAST_ROAD_CASCADE_DEBUG.append({
+                            "source": "WA_DNR", "layer": layer, "status": status,
+                        })
+                    continue
+                d, name = result
+                if debug_on:
+                    LAST_ROAD_CASCADE_DEBUG.append({
+                        "source": "WA_DNR", "layer": layer, "status": status,
+                        "nearest_m": round(d, 1), "name": name,
+                    })
+                if best is None or d < best[0]:
+                    best = (d, name, "WA_DNR")
 
     return best
 
