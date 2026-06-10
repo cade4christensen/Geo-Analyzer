@@ -370,7 +370,11 @@ def _arcgis_query_nearest_road(
 # data/wa_dnr_roads.pkl file.
 # ---------------------------------------------------------------------------
 
-_LOCAL_WADNR_PATH = Path(__file__).parent / "data" / "wa_dnr_roads.pkl"
+# Prefer the gzipped, simplified version (committed in the repo); fall back to
+# the raw uncompressed pickle if someone's testing with the un-compressed output
+# of build_roads_db.py before running compress_roads_db.py.
+_LOCAL_WADNR_PATH_GZ  = Path(__file__).parent / "data" / "wa_dnr_roads.pkl.gz"
+_LOCAL_WADNR_PATH_RAW = Path(__file__).parent / "data" / "wa_dnr_roads.pkl"
 _LOCAL_WADNR_LOCK = threading.Lock()
 _LOCAL_WADNR_LOADED = False
 _LOCAL_WADNR_GEOMS: List[LineString] = []
@@ -389,12 +393,19 @@ def _ensure_local_wadnr_loaded() -> bool:
         if _LOCAL_WADNR_LOADED:
             return _LOCAL_WADNR_TREE is not None
         try:
-            if not _LOCAL_WADNR_PATH.exists():
-                print(f"[local roads] no file at {_LOCAL_WADNR_PATH} — using HTTP cascade", flush=True)
+            if _LOCAL_WADNR_PATH_GZ.exists():
+                path = _LOCAL_WADNR_PATH_GZ
+                opener = lambda p: __import__("gzip").open(p, "rb")
+            elif _LOCAL_WADNR_PATH_RAW.exists():
+                path = _LOCAL_WADNR_PATH_RAW
+                opener = lambda p: open(p, "rb")
+            else:
+                print(f"[local roads] no file at {_LOCAL_WADNR_PATH_GZ} "
+                      f"or {_LOCAL_WADNR_PATH_RAW} — using HTTP cascade", flush=True)
                 _LOCAL_WADNR_LOADED = True
                 return False
             t0 = time.perf_counter()
-            with open(_LOCAL_WADNR_PATH, "rb") as f:
+            with opener(path) as f:
                 roads = pickle.load(f)
             _LOCAL_WADNR_GEOMS = [r[0] for r in roads]
             _LOCAL_WADNR_META  = [r[1] for r in roads]
