@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Optional
 from analyzer import analyze
 
@@ -163,9 +164,18 @@ def process_excel(input_path: str, round_to: str = "hundredth") -> str:
     for i, name in enumerate(TAIL_COLUMNS):
         write_header(tail_start + i, name, tail_fill)
 
-    # --- Process each data row ---
+    # --- First pass: parse coords, analyze each row, mark failures ERROR ---
     total_rows = ws.max_row - 1
+    # Track rows that need analysis (parseable coords) for use by retry loop.
+    # row_jobs maps ws row number → (lat, lon).
+    row_jobs: dict = {}
+    # row_attempts counts how many times we've tried this row in retries.
+    row_attempts: dict = {}
+    # row_last_err remembers the last exception message per row (for the summary).
+    row_last_err: dict = {}
+
     for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=1):
+        ws_row = row_idx + 1
         lat_val = row[lat_col].value
         lon_val = row[lon_col].value
 
@@ -195,17 +205,89 @@ def process_excel(input_path: str, round_to: str = "hundredth") -> str:
                             continue
 
         if lat_f is None or lon_f is None:
-            print(f"  Row {row_idx + 1}: skipped (invalid lat/lon: {lat_val}, {lon_val})")
-            _write_result_row(ws, row_idx + 1, summary_start, detail_start, tail_start, None)
+            # Bad coords — permanent failure, mark and skip retries.
+            print(f"  Row {ws_row}: skipped (invalid lat/lon: {lat_val}, {lon_val})")
+            _write_review_row(ws, ws_row, summary_start, detail_start, tail_start,
+                              reason="BAD_COORDS")
             continue
 
-        print(f"  [{row_idx}/{total_rows}] Analyzing ({lat_f}, {lon_f})...")
-        try:
-            result = analyze(lat_f, lon_f)
-            _write_result_row(ws, row_idx + 1, summary_start, detail_start, tail_start, result, round_to)
-        except Exception as e:
-            print(f"    Error: {e}")
-            _write_result_row(ws, row_idx + 1, summary_start, detail_start, tail_start, None, round_to)
+        # Detect coordinates outside Lower-48 US — NLCD won't have data there,
+        # so retries are pointless. L48 box: lat 24.4–49.4, lon −125 to −66.9.
+        if not (24.4 <= lat_f <= 49.4 and -125.0 <= lon_f <= -66.9):
+            print(f"  Row {ws_row}: outside US Lower 48 — skipping ({lat_f}, {lon_f})")
+            _write_review_row(ws, ws_row, summary_start, detail_start, tail_start,
+                              reason="OUTSIDE_US")
+            continue
+
+        # Eligible for analysis — record for the pass loop below.
+        row_jobs[ws_row] = (lat_f, lon_f)
+        row_attempts[ws_row] = 0
+
+    # --- Analysis with auto-retry: up to MAX_PASSES, MAX_ATTEMPTS_PER_ROW ---
+    MAX_PASSES = 5
+    MAX_ATTEMPTS_PER_ROW = 3
+    INTER_PASS_PAUSE_S = 8
+
+    pending = set(row_jobs.keys())
+    for pass_num in range(1, MAX_PASSES + 1):
+        if not pending:
+            break
+
+        if pass_num == 1:
+            print(f"\n=== Pass 1: analyzing {len(pending)} rows ===")
+        else:
+            print(f"\n=== Pass {pass_num}: retrying {len(pending)} ERROR rows "
+                  f"(waiting {INTER_PASS_PAUSE_S}s for rate limits to cool) ===")
+            time.sleep(INTER_PASS_PAUSE_S)
+
+        completed = set()
+        # Iterate pending in row order so progress reads top→bottom.
+        for ws_row in sorted(pending):
+            lat_f, lon_f = row_jobs[ws_row]
+            row_attempts[ws_row] += 1
+            attempt = row_attempts[ws_row]
+
+            print(f"  [pass {pass_num}, row {ws_row}, attempt {attempt}] "
+                  f"({lat_f}, {lon_f})...")
+            try:
+                result = analyze(lat_f, lon_f)
+                _write_result_row(ws, ws_row, summary_start, detail_start, tail_start,
+                                  result, round_to)
+                completed.add(ws_row)
+            except Exception as e:
+                msg = str(e)[:200]
+                row_last_err[ws_row] = msg
+                print(f"    Error: {msg}")
+                # Keep existing ERROR cells in place; will retry next pass
+                _write_result_row(ws, ws_row, summary_start, detail_start, tail_start,
+                                  None, round_to)
+                # If this row has hit its attempt cap, give up and mark for review.
+                if attempt >= MAX_ATTEMPTS_PER_ROW:
+                    _write_review_row(ws, ws_row, summary_start, detail_start,
+                                      tail_start, reason=f"FAILED:{msg[:60]}")
+                    completed.add(ws_row)  # remove from pending; retries exhausted
+
+        pending -= completed
+
+    # --- Summary ---
+    total_input = total_rows
+    success_count = total_input - len(pending) - sum(
+        1 for r in range(2, ws.max_row + 1)
+        if ws.cell(row=r, column=summary_start).value in (
+            "BAD_COORDS", "OUTSIDE_US")
+        or (isinstance(ws.cell(row=r, column=summary_start).value, str)
+            and ws.cell(row=r, column=summary_start).value.startswith("FAILED:"))
+    )
+    print(f"\n=== Batch complete ===")
+    print(f"  Successful: {success_count} / {total_input}")
+    if pending:
+        print(f"  Permanently failed (still ERROR after {MAX_PASSES} passes): {len(pending)}")
+        for ws_row in sorted(pending)[:10]:
+            lat_f, lon_f = row_jobs[ws_row]
+            err = row_last_err.get(ws_row, "no error captured")
+            print(f"    row {ws_row} ({lat_f}, {lon_f}): {err[:100]}")
+        if len(pending) > 10:
+            print(f"    ...and {len(pending) - 10} more")
 
     # --- Auto-size columns ---
     all_cols = SUMMARY_COLUMNS + DETAIL_COLUMNS + TAIL_COLUMNS
@@ -227,6 +309,21 @@ def process_excel(input_path: str, round_to: str = "hundredth") -> str:
     output_path = base + "_analyzed" + ext
     wb.save(output_path)
     return output_path
+
+
+def _write_review_row(ws, row: int, summary_start: int, detail_start: int,
+                      tail_start: int, reason: str):
+    """
+    Mark a row with a permanent failure tag (instead of "ERROR") so the user
+    can tell structural failures from transient ones. Used for: BAD_COORDS,
+    OUTSIDE_US, FAILED:<exception>.
+    """
+    total_cols = len(SUMMARY_COLUMNS) + len(DETAIL_COLUMNS) + len(TAIL_COLUMNS)
+    # First cell carries the tag, the rest stay blank so the spreadsheet stays
+    # readable on review.
+    ws.cell(row=row, column=summary_start, value=reason)
+    for i in range(1, total_cols):
+        ws.cell(row=row, column=summary_start + i, value="")
 
 
 def _write_result_row(ws, row: int, summary_start: int, detail_start: int,
