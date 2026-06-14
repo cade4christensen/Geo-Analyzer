@@ -1,3 +1,8 @@
 test_input.xlsx
 test_input_analyzed.xlsx
 data/wa_dnr_roads.pkl
+batch_input.xlsx
+batch_input_analyzed.xlsx
+batch_retry.xlsx
+batch_retry_analyzed.xlsx
+__pycache__/
